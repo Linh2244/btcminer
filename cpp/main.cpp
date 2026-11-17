@@ -18,10 +18,10 @@
 #endif
 #include <windows.h>
 
+#include "cpu.h"
 #include "job.h"
 #include "json.h"
 #include "miner.h"
-#include "cpu.h"
 #include "sha256.h"
 #include "util.h"
 #include "worker.h"
@@ -630,7 +630,7 @@ int run_self_test(const MinerConfig& config) {
     int failures = 0;
     util::Logger& log = util::log();
 
-    log.info("self-test 1/3: SHA-256d reference vector (block 125552)");
+    log.info("self-test 1/4: SHA-256d reference vector (block 125552)");
     uint8_t header[80];
     std::vector<uint8_t> decoded;
     if (!util::hex_decode(kReferenceHeaderHex, decoded, 80, nullptr)) {
@@ -719,7 +719,7 @@ int run_self_test(const MinerConfig& config) {
         log.info("  --   SHA-NI not available on this CPU");
     }
 
-    log.info("self-test 2/3: difficulty <-> target conversion");
+    log.info("self-test 2/4: difficulty <-> target conversion");
     uint8_t target[32];
     util::difficulty_to_target(1.0, target);
     uint8_t expected[32] = {0};
@@ -764,7 +764,72 @@ int run_self_test(const MinerConfig& config) {
                  util::hex_encode(target, 32).c_str());
     }
 
-    log.info("self-test 3/3: mining an easy share (%d thread(s), difficulty 1e-05)",
+    log.info("self-test 3/4: BIP310 version rolling");
+
+    struct DepositCase {
+        uint32_t value;
+        uint32_t mask;
+        uint32_t expected;
+    };
+    const DepositCase deposit_cases[] = {
+        {0, 0x1fffe000u, 0x00000000u},
+        {1, 0x1fffe000u, 0x00002000u},
+        {0xffffu, 0x1fffe000u, 0x1fffe000u},
+        {0x8000u, 0x1fffe000u, 0x10000000u},
+        {3, 0x00000003u, 0x00000003u},
+        {3, 0x0000000au, 0x0000000au},
+        {0xffffffffu, 0x0000000fu, 0x0000000fu},
+    };
+    bool deposit_ok = true;
+    for (const DepositCase& item : deposit_cases) {
+        uint32_t got = deposit_bits(item.value, item.mask);
+        if (got != item.expected) {
+            log.error("  FAIL deposit_bits(%08x, %08x) = %08x, expected %08x",
+                      (unsigned)item.value, (unsigned)item.mask,
+                      (unsigned)got, (unsigned)item.expected);
+            deposit_ok = false;
+        }
+    }
+
+    // A midstate rebuilt for a rolled version must hash exactly like a full
+    // 80-byte header carrying that version.
+    const uint32_t test_mask = 0x1fffe000u;
+    const uint32_t base_version = 0x20000000u;
+    const uint32_t nonce = 0x12345678u;
+    uint8_t rolled_header[80];
+    std::vector<uint8_t> roll_noise = util::random_bytes(80);
+    std::memcpy(rolled_header, roll_noise.data(), 80);
+    std::memset(rolled_header + 76, 0, 4);
+    uint32_t rolled_version =
+        (base_version & ~test_mask) | deposit_bits(31337, test_mask);
+    set_header_version(rolled_header, rolled_version);
+
+    sha256::Midstate rolled_mid;
+    sha256::build_midstate(rolled_mid, rolled_header);
+    uint8_t via_mid[32];
+    sha256::hash_nonce(rolled_mid, nonce, via_mid);
+
+    uint8_t full_header[80];
+    std::memcpy(full_header, rolled_header, 80);
+    full_header[76] = uint8_t(nonce);
+    full_header[77] = uint8_t(nonce >> 8);
+    full_header[78] = uint8_t(nonce >> 16);
+    full_header[79] = uint8_t(nonce >> 24);
+    uint8_t via_header[32];
+    sha256::hash_header(full_header, via_header);
+    bool midstate_ok = std::memcmp(via_mid, via_header, 32) == 0;
+
+    if (deposit_ok && midstate_ok) {
+        log.info("  OK   deposit_bits vectors and rolled midstate (%08x)",
+                 (unsigned)rolled_version);
+    } else {
+        if (!midstate_ok) {
+            log.error("  FAIL rolled midstate does not match the full header");
+        }
+        ++failures;
+    }
+
+    log.info("self-test 4/4: mining an easy share (%d thread(s), difficulty 1e-05)",
              config.threads);
     sha256::Midstate mid;
     uint8_t full[80];
@@ -797,7 +862,7 @@ int run_self_test(const MinerConfig& config) {
         for (const Share& share : shares) {
             uint8_t verify_raw[32];
             uint8_t verify_be[32];
-            sha256::hash_nonce_scalar(mid, share.nonce, verify_raw);
+            sha256::hash_nonce_scalar(share.mid, share.nonce, verify_raw);
             for (int i = 0; i < 32; ++i) verify_be[i] = verify_raw[31 - i];
             if (std::memcmp(verify_be, work->target, 32) > 0) valid = false;
         }

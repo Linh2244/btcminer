@@ -187,3 +187,18 @@ void make_midstate(const Job& job, const std::vector<uint8_t>& extranonce2,
     std::memset(full + 76, 0, 4);
     sha256::build_midstate(mid, full);
 }
+
+void set_header_version(uint8_t header[80], uint32_t version) {
+    put_le32(header, version);
+}
+
+uint32_t deposit_bits(uint32_t value, uint32_t mask) {
+    uint32_t result = 0;
+    uint32_t source = 1;
+    for (int bit = 0; bit < 32; ++bit) {
+        if (!(mask & (1u << bit))) continue;
+        if (value & source) result |= 1u << bit;
+        source <<= 1;
+    }
+    return result;
+}

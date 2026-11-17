@@ -96,6 +96,9 @@ void WorkerPool::loop(int index) {
 
     std::shared_ptr<const Work> work;
     uint32_t seen_generation = 0;
+    sha256::Midstate current_mid{};
+    uint32_t current_version = 0;
+    uint32_t roll = 0;
 
     while (!stop_.load(std::memory_order_acquire)) {
         if (!work ||
@@ -109,6 +112,9 @@ void WorkerPool::loop(int index) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 continue;
             }
+            current_mid = work->mid;
+            current_version = work->version;
+            roll = 0;
         }
 
         uint64_t remaining = hi - position;
@@ -121,11 +127,32 @@ void WorkerPool::loop(int index) {
         uint32_t nonces[kMaxSharesPerChunk];
         uint8_t digests[kMaxSharesPerChunk][32];
         auto chunk_started = std::chrono::steady_clock::now();
-        int found = sha256::scan(work->mid, uint32_t(position), count,
+        int found = sha256::scan(current_mid, uint32_t(position), count,
                                  work->target, nonces, digests,
                                  kMaxSharesPerChunk);
 
         hashes_.fetch_add(count, std::memory_order_relaxed);
+
+        // Verify and queue shares before rolling the version, so a share is
+        // always checked against the midstate that found it.
+        for (int i = 0; i < found; ++i) {
+            // Double check with the portable kernel: a bug in the SIMD kernel
+            // must never produce a bogus share.
+            uint8_t raw[32];
+            uint8_t be[32];
+            sha256::hash_nonce_scalar(current_mid, nonces[i], raw);
+            for (int j = 0; j < 32; ++j) be[j] = raw[31 - j];
+            if (std::memcmp(be, work->target, 32) > 0) continue;
+
+            Share share;
+            share.nonce = nonces[i];
+            share.version = current_version;
+            share.mid = current_mid;
+            share.work = work;
+            share.thread = index;
+            std::lock_guard<std::mutex> lock(share_mutex_);
+            shares_.push_back(std::move(share));
+        }
 
         // Approximate CPU limit: hash a chunk, then idle for the rest of the
         // duty cycle.  Capped so that job changes stay responsive.
@@ -140,23 +167,20 @@ void WorkerPool::loop(int index) {
             }
         }
         position += count;
-        if (position >= hi) position = lo;
-
-        for (int i = 0; i < found; ++i) {
-            // Double check with the portable kernel: a bug in the SIMD kernel
-            // must never produce a bogus share.
-            uint8_t raw[32];
-            uint8_t be[32];
-            sha256::hash_nonce_scalar(work->mid, nonces[i], raw);
-            for (int j = 0; j < 32; ++j) be[j] = raw[31 - j];
-            if (std::memcmp(be, work->target, 32) > 0) continue;
-
-            Share share;
-            share.nonce = nonces[i];
-            share.work = work;
-            share.thread = index;
-            std::lock_guard<std::mutex> lock(share_mutex_);
-            shares_.push_back(std::move(share));
+        if (position >= hi) {
+            position = lo;
+            // BIP310: each nonce-range wrap rolls the version by one step
+            // across the pool's mask and rebuilds the midstate.
+            if (work->version_mask) {
+                ++roll;
+                current_version =
+                    (work->version & ~work->version_mask) |
+                    deposit_bits(roll, work->version_mask);
+                uint8_t header[80];
+                std::memcpy(header, work->header, 80);
+                set_header_version(header, current_version);
+                sha256::build_midstate(current_mid, header);
+            }
         }
     }
 }

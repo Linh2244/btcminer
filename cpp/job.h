@@ -36,5 +36,12 @@ void build_header_prefix(const Job& job, const std::vector<uint8_t>& extranonce2
 void make_midstate(const Job& job, const std::vector<uint8_t>& extranonce2,
                    sha256::Midstate& mid);
 
+// Writes a version into the first four bytes of an 80-byte header.
+void set_header_version(uint8_t header[80], uint32_t version);
+
+// Spreads the low bits of `value` over the set bits of `mask` (BIP310
+// version rolling).  Bits of `value` above the mask population are dropped.
+uint32_t deposit_bits(uint32_t value, uint32_t mask);
+
 // Reverses the bytes inside every 4-byte word (stratum prevhash encoding).
 std::vector<uint8_t> word_swap(const std::vector<uint8_t>& data);

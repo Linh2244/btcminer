@@ -77,6 +77,8 @@ private:
     void on_set_difficulty(const Json& params);
     void on_set_extranonce(const Json& params);
     void apply_subscription(const Json& result);
+    void negotiate_version_rolling();
+    void on_set_version_mask(const Json& params);
     void set_difficulty(double difficulty);
     void publish_work();
     void on_share(const Share& share);
@@ -99,6 +101,9 @@ private:
     std::vector<uint8_t> extranonce1_;
     size_t extranonce2_size_ = 4;
     std::vector<uint8_t> extranonce2_;
+
+    // BIP310 version rolling for the current session (0 = off).
+    uint32_t version_mask_ = 0;
 
     bool have_difficulty_ = false;
     double difficulty_ = 0.0;

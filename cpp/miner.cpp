@@ -4,6 +4,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -28,6 +29,33 @@ std::string json_error_text(const Json& error) {
         return error[1].as_string();
     }
     return error.dump();
+}
+
+// Parses an 8-digit hexadecimal version mask (BIP310).
+bool parse_version_mask(const Json& value, uint32_t& mask) {
+    std::string text;
+    if (value.is_string()) {
+        text = value.as_string();
+    } else if (value.is_number()) {
+        char buffer[16];
+        std::snprintf(buffer, sizeof(buffer), "%08x",
+                      (unsigned)uint32_t(value.as_int(0)));
+        text = buffer;
+    } else {
+        return false;
+    }
+    if (text.empty() || text.size() > 8) return false;
+    uint32_t parsed = 0;
+    for (char c : text) {
+        int digit = -1;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+        if (digit < 0) return false;
+        parsed = (parsed << 4) | uint32_t(digit);
+    }
+    mask = parsed;
+    return true;
 }
 
 }  // namespace
@@ -171,6 +199,7 @@ void Miner::session(const PoolCredentials& pool) {
     subscribe_params.push(Json::make_string(config_.user_agent));
     Json result = client_->request("mining.subscribe", subscribe_params, 30.0);
     apply_subscription(result);
+    negotiate_version_rolling();
 
     if (config_.has_suggest && config_.suggest_difficulty > 0.0) {
         Json suggest = Json::make_array();
@@ -271,6 +300,82 @@ void Miner::apply_subscription(const Json& result) {
     work_key_.clear();
 }
 
+void Miner::negotiate_version_rolling() {
+    version_mask_ = 0;
+    if (!config_.version_rolling || config_.version_mask == 0) {
+        util::log().debug("version rolling disabled by configuration");
+        return;
+    }
+
+    Json extensions = Json::make_array();
+    extensions.push(Json::make_string("version-rolling"));
+    Json parameters = Json::make_object();
+    char requested[16];
+    std::snprintf(requested, sizeof(requested), "%08x",
+                  (unsigned)config_.version_mask);
+    parameters.set("version-rolling.mask", Json::make_string(requested));
+    parameters.set("version-rolling.min-bit-count", Json::make_int(2));
+    Json request = Json::make_array();
+    request.push(std::move(extensions));
+    request.push(std::move(parameters));
+
+    Json result;
+    try {
+        result = client_->request("mining.configure", request, 10.0);
+    } catch (const std::exception& error) {
+        util::log().info("pool did not accept mining.configure: %s",
+                         error.what());
+        return;
+    }
+
+    const Json* supported =
+        result.is_object() ? result.find("version-rolling") : nullptr;
+    if (!supported || !supported->is_bool() || !supported->as_bool()) {
+        util::log().info("pool does not support version rolling");
+        return;
+    }
+
+    uint32_t mask = config_.version_mask;
+    const Json* mask_value =
+        result.is_object() ? result.find("version-rolling.mask") : nullptr;
+    if (mask_value && !parse_version_mask(*mask_value, mask)) {
+        util::log().warn("pool returned a malformed version mask, using %08x",
+                         (unsigned)config_.version_mask);
+        mask = config_.version_mask;
+    }
+    if (mask == 0) {
+        util::log().info("pool negotiated an empty version mask, rolling off");
+        return;
+    }
+    version_mask_ = mask;
+    util::log().info("version rolling enabled | mask %08x", (unsigned)mask);
+}
+
+void Miner::on_set_version_mask(const Json& params) {
+    if (params.size() < 1) {
+        util::log().warn("empty mining.set_version_mask");
+        return;
+    }
+    uint32_t mask = 0;
+    if (!parse_version_mask(params[0], mask)) {
+        util::log().warn("ignoring malformed mining.set_version_mask: %s",
+                         params.dump().c_str());
+        return;
+    }
+    if (mask == version_mask_) {
+        util::log().debug("pool repeated the version mask %08x", (unsigned)mask);
+        return;
+    }
+    version_mask_ = mask;
+    if (mask) {
+        util::log().info("pool updated the version rolling mask to %08x",
+                         (unsigned)mask);
+    } else {
+        util::log().info("pool disabled version rolling for this session");
+    }
+    if (have_job_) publish_work();
+}
+
 // ---------------------------------------------------------------------------
 // pool messages
 // ---------------------------------------------------------------------------
@@ -291,6 +396,8 @@ void Miner::handle_message(const Json& message) {
             on_set_difficulty(params);
         } else if (name == "mining.set_extranonce") {
             on_set_extranonce(params);
+        } else if (name == "mining.set_version_mask") {
+            on_set_version_mask(params);
         } else if (name == "client.get_version") {
             const Json* id = message.find("id");
             if (id && client_) {
@@ -301,8 +408,7 @@ void Miner::handle_message(const Json& message) {
                              params.size() ? params[0].as_string().c_str() : "");
         } else if (name == "client.reconnect") {
             throw StratumDisconnected("pool requested a reconnect");
-        } else if (name == "mining.set_version_mask" || name == "mining.ping" ||
-                   name == "mining.set_goal") {
+        } else if (name == "mining.ping" || name == "mining.set_goal") {
             util::log().debug("ignoring %s: %s", name.c_str(),
                               params.dump().c_str());
         } else {
@@ -439,14 +545,21 @@ void Miner::publish_work() {
     }
     util::log().debug("header %s", util::hex_encode(header76, 76).c_str());
     work->generation = ++generation_;
+    std::memcpy(work->header, full, 80);
+    work->version = job_.version;
+    work->version_mask = version_mask_;
     std::memcpy(work->target, target_, 32);
     work->job_id = job_.id;
     work->ntime_hex = job_.ntime_hex;
     work->extranonce2_hex = util::hex_encode(extranonce2_);
     work->difficulty = difficulty_;
 
+    char mask_text[16];
+    std::snprintf(mask_text, sizeof(mask_text), "%08x",
+                  (unsigned)work->version_mask);
     std::string key = job_.id + "|" + work->extranonce2_hex + "|" +
-                      util::hex_encode(target_, 32) + "|" + job_.ntime_hex;
+                      util::hex_encode(target_, 32) + "|" + job_.ntime_hex +
+                      "|" + mask_text;
     if (key == work_key_) return;
     work_key_ = key;
 
@@ -462,17 +575,26 @@ void Miner::publish_work() {
 void Miner::on_share(const Share& share) {
     uint8_t raw[32];
     uint8_t be[32];
-    sha256::hash_nonce_scalar(share.work->mid, share.nonce, raw);
+    sha256::hash_nonce_scalar(share.mid, share.nonce, raw);
     for (int i = 0; i < 32; ++i) be[i] = raw[31 - i];
     double share_difficulty = util::target_to_difficulty(be);
 
     ++shares_found_;
     best_difficulty_ = std::max(best_difficulty_, share_difficulty);
-    util::log().info(
-        "share found | worker %d | job %s | nonce %s | difficulty %s",
-        share.thread, share.work->job_id.c_str(),
-        util::format_nonce(share.nonce).c_str(),
-        util::format_difficulty(share_difficulty).c_str());
+    if (share.work->version_mask) {
+        util::log().info(
+            "share found | worker %d | job %s | nonce %s | version %08x | "
+            "difficulty %s",
+            share.thread, share.work->job_id.c_str(),
+            util::format_nonce(share.nonce).c_str(), (unsigned)share.version,
+            util::format_difficulty(share_difficulty).c_str());
+    } else {
+        util::log().info(
+            "share found | worker %d | job %s | nonce %s | difficulty %s",
+            share.thread, share.work->job_id.c_str(),
+            util::format_nonce(share.nonce).c_str(),
+            util::format_difficulty(share_difficulty).c_str());
+    }
 
     if (!client_) {
         util::log().warn("no active pool connection, share dropped");
@@ -485,6 +607,13 @@ void Miner::on_share(const Share& share) {
     params.push(Json::make_string(share.work->extranonce2_hex));
     params.push(Json::make_string(share.work->ntime_hex));
     params.push(Json::make_string(util::format_nonce(share.nonce)));
+    // BIP310: the sixth parameter is only valid while a mask is negotiated.
+    if (share.work->version_mask) {
+        char version_hex[16];
+        std::snprintf(version_hex, sizeof(version_hex), "%08x",
+                      (unsigned)share.version);
+        params.push(Json::make_string(version_hex));
+    }
 
     int id = client_->send_request("mining.submit", params);
     pending_[id] = PendingShare{share_difficulty, share.work->job_id};

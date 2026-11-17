@@ -12,11 +12,10 @@ Usage::
 
 from __future__ import annotations
 
-import ast
+import argparse
 import hashlib
 import json
 import os
-import random
 import socket
 import struct
 import subprocess
@@ -27,8 +26,7 @@ import time
 DIFFICULTY = 1e-5
 EXTRANONCE1 = "f00dbabe"
 EXTRANONCE2_SIZE = 4
-
-NONCE_SPACE_TARGET = int(0xFFFF * 2**208 / DIFFICULTY)
+VERSION_MASK = 0x1FFFE000
 
 
 def bits_to_target(difficulty: float) -> int:
@@ -36,7 +34,7 @@ def bits_to_target(difficulty: float) -> int:
 
 
 class FakePool(threading.Thread):
-    def __init__(self):
+    def __init__(self, version_rolling: bool = False):
         super().__init__(daemon=True)
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -55,6 +53,9 @@ class FakePool(threading.Thread):
             "%08x" % int(time.time()),
             True,
         ]
+        self.version_rolling = version_rolling
+        self.configure_seen = False
+        self.version_params = 0
         self.valid = 0
         self.invalid = 0
         self.errors = []
@@ -125,6 +126,17 @@ class FakePool(threading.Thread):
             self._send(conn, {
                 "id": None, "method": "mining.notify", "params": self.notify,
             })
+        elif method == "mining.configure":
+            self.configure_seen = True
+            result = {"version-rolling": False}
+            if self.version_rolling:
+                result = {
+                    "version-rolling": True,
+                    "version-rolling.mask": "%08x" % VERSION_MASK,
+                }
+            self._send(conn, {
+                "id": request_id, "error": None, "result": result,
+            })
         elif method == "mining.submit":
             ok, detail = self._verify(message.get("params") or [])
             with self.lock:
@@ -149,6 +161,21 @@ class FakePool(threading.Thread):
             if ntime_hex != self.notify[7]:
                 return False, "ntime %r != %r" % (ntime_hex, self.notify[7])
 
+            base_version = int(self.notify[5], 16)
+            if self.version_rolling:
+                if len(params) < 6:
+                    return False, "mining.submit is missing the version"
+                version = int(params[5], 16)
+                self.version_params += 1
+                if version & ~VERSION_MASK != base_version & ~VERSION_MASK:
+                    return False, "version %08x does not keep the base bits" % version
+                if version & VERSION_MASK:
+                    return False, "unexpected rolled version bits %08x" % version
+            else:
+                version = base_version
+                if len(params) != 5:
+                    return False, "unexpected 6th submit parameter %r" % (params[5],)
+
             coinbase = (
                 bytes.fromhex(self.notify[2])
                 + bytes.fromhex(EXTRANONCE1)
@@ -166,7 +193,7 @@ class FakePool(threading.Thread):
                 for i in range(0, 32, 4)
             )
             header = (
-                bytes.fromhex(self.notify[5])[::-1]
+                version.to_bytes(4, "little")
                 + prevhash
                 + root
                 + bytes.fromhex(self.notify[7])[::-1]
@@ -185,13 +212,23 @@ class FakePool(threading.Thread):
 
 
 def main():
-    exe = sys.argv[1] if len(sys.argv) > 1 else os.path.join("dist", "btcminer.exe")
-    exe = os.path.abspath(exe)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "exe", nargs="?", default=os.path.join("dist", "btcminer.exe"),
+        help="path to btcminer.exe",
+    )
+    parser.add_argument(
+        "--version-rolling", action="store_true",
+        help="advertise BIP310 version rolling in the fake pool",
+    )
+    args = parser.parse_args()
+
+    exe = os.path.abspath(args.exe)
     if not os.path.isfile(exe):
         print("FAIL: executable not found:", exe)
         return 2
 
-    pool = FakePool()
+    pool = FakePool(version_rolling=args.version_rolling)
     pool.start()
     url = "stratum+tcp://127.0.0.1:%d" % pool.port
     print("fake pool on", url)
@@ -200,6 +237,7 @@ def main():
         [
             exe, "-o", url, "-u", "test.worker", "-p", "x", "-t", "2",
             "--duration", "12", "--stats-interval", "5", "--log-level", "INFO",
+            "--no-api",
         ],
         capture_output=True,
         text=True,
@@ -219,12 +257,23 @@ def main():
     print("valid shares:", pool.valid, "invalid:", pool.invalid)
     for error in pool.errors[:5]:
         print("  ", error)
+    print("version rolling negotiated:", pool.configure_seen,
+          "| submits with version:", pool.version_params)
+
+    version_ok = True
+    if args.version_rolling:
+        version_ok = (
+            pool.configure_seen
+            and pool.version_params >= 1
+            and "version rolling enabled" in output
+        )
 
     ok = (
         proc.returncode == 0
         and pool.valid >= 1
         and pool.invalid == 0
         and accepted >= 1
+        and version_ok
     )
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

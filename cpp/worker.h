@@ -14,7 +14,10 @@
 
 struct Work {
     uint32_t generation = 0;
-    sha256::Midstate mid{};
+    sha256::Midstate mid{};      // midstate of the job's base version
+    uint8_t header[80] = {0};    // 80-byte header with the nonce zeroed
+    uint32_t version = 0;        // version reported by the job
+    uint32_t version_mask = 0;   // BIP310 mask, 0 = rolling disabled
     uint8_t target[32] = {0};  // big-endian (display order)
     std::string job_id;
     std::string ntime_hex;
@@ -24,6 +27,8 @@ struct Work {
 
 struct Share {
     uint32_t nonce = 0;
+    uint32_t version = 0;        // version that was actually hashed
+    sha256::Midstate mid{};      // midstate used for that version
     std::shared_ptr<const Work> work;
     int thread = 0;
 };
