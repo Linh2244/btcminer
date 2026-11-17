@@ -15,7 +15,7 @@ namespace {
 
 //: Difficulty assumed if a pool sends a job before mining.set_difficulty.
 constexpr double kDefaultDifficulty = 1.0;
-constexpr const char* kVersion = "1.1.0";
+constexpr const char* kVersion = "1.2.0";
 
 std::string lower_ascii(std::string text) {
     for (char& c : text) c = char(std::tolower((unsigned char)c));

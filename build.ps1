@@ -51,6 +51,7 @@ function Build-Object {
 
 Build-Object -Source "cpp/sha256.cpp"      -Object "build/sha256.o"
 Build-Object -Source "cpp/sha256_avx2.cpp" -Object "build/sha256_avx2.o" -Extra @("-mavx2")
+Build-Object -Source "cpp/sha256_shani.cpp" -Object "build/sha256_shani.o" -Extra @("-msha", "-mssse3", "-msse4.1")
 foreach ($name in @("util", "json", "job", "stratum", "worker", "miner", "main")) {
     Build-Object -Source "cpp/$name.cpp" -Object "build/$name.o"
 }
@@ -58,19 +59,20 @@ foreach ($name in @("util", "json", "job", "stratum", "worker", "miner", "main")
 $objects = @(
     "build/util.o", "build/json.o", "build/job.o", "build/stratum.o",
     "build/worker.o", "build/miner.o", "build/main.o",
-    "build/sha256.o", "build/sha256_avx2.o"
+    "build/sha256.o", "build/sha256_avx2.o", "build/sha256_shani.o"
 )
 
 if ($Tools) {
     Build-Object -Source "cpp/tools/bench.cpp" -Object "build/tools_bench.o"
     & g++ -O3 -std=c++17 "build/tools_bench.o" "build/sha256.o" "build/sha256_avx2.o" `
-        -o "build/bench.exe"
+        "build/sha256_shani.o" -o "build/bench.exe"
     if ($LASTEXITCODE -ne 0) { throw "link failed: bench.exe" }
     Write-Host "  ok build/bench.exe"
 
     Build-Object -Source "cpp/tools/check.cpp" -Object "build/tools_check.o"
     & g++ -O3 -std=c++17 "build/tools_check.o" "build/json.o" "build/job.o" `
-        "build/util.o" "build/sha256.o" "build/sha256_avx2.o" -o "build/check.exe"
+        "build/util.o" "build/sha256.o" "build/sha256_avx2.o" "build/sha256_shani.o" `
+        -o "build/check.exe"
     if ($LASTEXITCODE -ne 0) { throw "link failed: check.exe" }
     Write-Host "  ok build/check.exe"
 }

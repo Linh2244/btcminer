@@ -27,7 +27,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.1.0";
+constexpr const char* kVersion = "1.2.0";
 constexpr const char* kDefaultConfigFile = "config.json";
 
 //: Block 125552 - the classic SHA-256d reference vector.
@@ -92,7 +92,7 @@ int physical_cores() {
 }
 
 int default_threads() {
-    // SMT still helps the AVX2 kernel (measured ~40% more hashrate on a
+    // SMT still helps the SIMD kernels (measured ~40% more hashrate on a
     // 4c/8t laptop), so default to the logical processor count.
     unsigned logical = std::thread::hardware_concurrency();
     if (logical > 0) return int(logical);
@@ -449,6 +449,47 @@ int run_self_test(const MinerConfig& config) {
         }
     } else {
         log.info("  --   AVX2 not available, using the scalar kernel");
+    }
+
+    if (sha256::has_sha_ni()) {
+        sha256::Midstate mid;
+        sha256::build_midstate(mid, header);
+        const uint32_t nonce = uint32_t(header[76]) |
+                               (uint32_t(header[77]) << 8) |
+                               (uint32_t(header[78]) << 16) |
+                               (uint32_t(header[79]) << 24);
+        uint8_t ni_raw[32];
+        uint8_t ni_display[32];
+        sha256::hash_nonce_sha_ni(mid, nonce, ni_raw);
+        for (int i = 0; i < 32; ++i) ni_display[i] = ni_raw[31 - i];
+        hex = util::hex_encode(ni_display, 32);
+        if (hex == kReferenceHash) {
+            log.info("  OK   SHA-NI hashes block 125552 to %s", hex.c_str());
+        } else {
+            log.error("  FAIL SHA-NI expected %s, got %s", kReferenceHash,
+                      hex.c_str());
+            ++failures;
+        }
+
+        int mismatches = 0;
+        uint32_t seed = 0x9e3779b9u;
+        for (int i = 0; i < 2048; ++i) {
+            seed = seed * 1103515245u + 12345u;
+            uint8_t scalar_raw[32];
+            uint8_t ni_raw2[32];
+            sha256::hash_nonce_scalar(mid, seed, scalar_raw);
+            sha256::hash_nonce_sha_ni(mid, seed, ni_raw2);
+            if (std::memcmp(scalar_raw, ni_raw2, 32) != 0) ++mismatches;
+        }
+        if (mismatches) {
+            log.error("  FAIL SHA-NI kernel differs from scalar in %d cases",
+                      mismatches);
+            ++failures;
+        } else {
+            log.info("  OK   SHA-NI kernel matches scalar (2048 nonces)");
+        }
+    } else {
+        log.info("  --   SHA-NI not available on this CPU");
     }
 
     log.info("self-test 2/3: difficulty <-> target conversion");

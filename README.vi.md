@@ -8,7 +8,8 @@ tính block header, tìm nonce thoả mãn target của pool và gửi share v�
 
 * **Một file `.exe` duy nhất**, biên dịch tĩnh: không cần runtime, không cần
   thư viện ngoài (chỉ Winsock2 của Windows).
-* **SHA-256d 8 làn bằng AVX2** (tự phát hiện CPU, có kernel scalar dự phòng) và
+* **Ba kernel băm tự chọn**: SHA-NI trên CPU đời mới, AVX2 8 làn trên CPU
+  Haswell/Zen, và kernel scalar dự phòng (tự phát hiện bằng CPUID) cùng
   **midstate**: 64 byte đầu của header chỉ băm một lần cho mỗi job, mỗi nonce
   chỉ cần 2 lần nén SHA-256.
 * Đa luồng bằng `std::thread` (mặc định = số CPU luận lý) để tận dụng mọi core.
@@ -90,7 +91,8 @@ tải về nằm ở [GitHub Releases](https://github.com/Linh2244/btcminer/rele
 powershell -ExecutionPolicy Bypass -File .\build.ps1        # -> dist\btcminer.exe
 ```
 
-Script sẽ biên dịch từng file (riêng `sha256_avx2.cpp` dùng `-mavx2`), link
+Script sẽ biên dịch từng file (`sha256_avx2.cpp` dùng `-mavx2`,
+`sha256_shani.cpp` dùng `-msha -mssse3 -msse4.1`), link
 tĩnh với `-static -static-libgcc -static-libstdc++ -lws2_32` rồi **tự chạy
 `--self-test`**. Các tuỳ chọn:
 
@@ -104,13 +106,14 @@ Hoặc gọi `g++` trực tiếp:
 ```powershell
 g++ -O3 -std=c++17 -c cpp/sha256.cpp      -o build/sha256.o
 g++ -O3 -std=c++17 -mavx2 -c cpp/sha256_avx2.cpp -o build/sha256_avx2.o
+g++ -O3 -std=c++17 -msha -mssse3 -msse4.1 -c cpp/sha256_shani.cpp -o build/sha256_shani.o
 foreach ($s in "util","json","job","stratum","worker","miner","main") {
     g++ -O3 -std=c++17 -c "cpp/$s.cpp" -o "build/$s.o"
 }
 g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
     build/util.o build/json.o build/job.o build/stratum.o build/worker.o `
     build/miner.o build/main.o build/sha256.o build/sha256_avx2.o `
-    -o dist/btcminer.exe -lws2_32
+    build/sha256_shani.o -o dist/btcminer.exe -lws2_32
 ```
 
 > Máy nào tắt script (Execution Policy) thì dùng
@@ -182,9 +185,9 @@ Bộ test gồm:
 
 * **Vector chuẩn Bitcoin**: header block 125552 phải băm ra
   `00000000000000001e8d6829a8a21adc5d38d0a473b144b6765798e61f98bd1d`
-  (kiểm tra cho cả kernel scalar và AVX2).
-* **Đối chiếu AVX2 với scalar** trên 2048–4096 nonce ngẫu nhiên: sai lệch phải
-  bằng 0.
+  (kiểm tra cho cả kernel scalar, AVX2 và SHA-NI).
+* **Đối chiếu AVX2/SHA-NI với scalar** trên 2048–4096 nonce ngẫu nhiên: sai lệch
+  phải bằng 0.
 * **Dữ liệu thật từ pool**: một `mining.notify` lấy từ `solo.ckpool.org` được
   dùng để kiểm tra cách đổi byte-order của `prevhash`, `version`, `ntime`,
   `nbits` (đối chiếu với hash block cha trên chuỗi).
@@ -265,8 +268,9 @@ Các quy ước này đã được kiểm chứng bằng dữ liệu thật từ
 
 ```
 cpp/
-  sha256.h/.cpp    # SHA-256d, midstate, dispatch AVX2/scalar, quét nonce
+  sha256.h/.cpp    # SHA-256d, midstate, dispatch SHA-NI/AVX2/scalar, quét nonce
   sha256_avx2.cpp  # kernel 8 làn bằng AVX2 (biên dịch với -mavx2)
+  sha256_shani.cpp # kernel SHA-NI (biên dịch với -msha -mssse3 -msse4.1)
   job.h/.cpp       # parse mining.notify, coinbase/merkle, header prefix, midstate
   stratum.h/.cpp   # client JSON-RPC qua TCP (Winsock2, buffer, backlog)
   worker.h/.cpp    # WorkerPool (std::thread, chia dải nonce, double-check share)
@@ -284,8 +288,8 @@ tests/fake_pool_check.py  # test đầu-cuối cho exe C++ (pool giả)
   `Work` cho pool thread, nhận share và submit.
 * Mỗi worker thread: quét một dải nonce riêng (mỗi dải 2^32/N), kiểm tra job
   mới sau mỗi 8192 nonce nên chuyển job gần như tức thì khi có block mới.
-* Mọi share do AVX2 tìm ra đều được **băm lại bằng kernel scalar** trước khi
-  gửi — lỗi SIMD không thể tạo share rác.
+* Mọi share do kernel SIMD (AVX2/SHA-NI) tìm ra đều được **băm lại bằng kernel
+  scalar** trước khi gửi — lỗi SIMD không thể tạo share rác.
 
 ## 7. Hiệu năng (số đo thực trên máy kiểm thử)
 
@@ -304,8 +308,13 @@ có AVX2 + BMI2), bị giới hạn điện năng ~15 W.
   giảm — tổng vẫn tăng.
 * CPU **không có SHA-NI** vẫn nhanh hơn Python ~17× vì nút cổ chai của Python
   là vòng lặp `for` chứ không phải hàm băm.
-* Nếu CPU có AVX2, `--self-test` sẽ in `kernel avx2 (8 lanes)`; máy chỉ có
-  SSE/không AVX2 vẫn chạy được bằng kernel scalar (chậm hơn ~5×).
+* Nếu CPU có AVX2, `--self-test` sẽ in `kernel avx2 (8 lanes)`; nếu có SHA-NI
+  thì in `kernel sha-ni`; máy chỉ có SSE/không AVX2 vẫn chạy được bằng kernel
+  scalar (chậm hơn ~5×).
+* Kernel SHA-NI chạy 1 nonce mỗi chuỗi (không đan nhiều nonce) nhưng mỗi lần nén
+  chỉ tốn vài lệnh `SHA256RNDS2`/`SHA256MSG1`/`SHA256MSG2`. Máy kiểm thử không
+  có SHA-NI nên không có số MH/s cho kernel này; tính đúng đắn được đối chiếu
+  với kernel scalar bằng Intel SDE (`sde -tgl -- .\build\bench.exe`).
 * Muốn nhanh hơn nữa: dùng GPU/ASIC, hoặc thêm kernel SHA-NI cho CPU có hỗ trợ.
 
 ## 8. Pool và độ khó
@@ -341,7 +350,7 @@ có AVX2 + BMI2), bị giới hạn điện năng ~15 W.
 | Không thấy share nào | difficulty pool quá cao so với hashrate CPU — hãy dùng `--self-test` để chắc chắn miner hoạt động |
 | `g++ not found on PATH` | cài MinGW-w64 (WinLibs) rồi mở lại terminal |
 | `build.ps1 cannot be loaded ... running scripts is disabled` | `powershell -ExecutionPolicy Bypass -File .\build.ps1` |
-| `kernel scalar` thay vì `avx2` trong log | CPU không có AVX2 (hoặc chạy trong VM không bật AVX2) — vẫn đúng, chỉ chậm hơn |
+| `kernel scalar` thay vì `sha-ni`/`avx2` trong log | CPU không có SHA-NI/AVX2 (hoặc VM không bật) — vẫn đúng, chỉ chậm hơn |
 
 ## 11. Tham khảo
 

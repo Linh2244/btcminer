@@ -48,6 +48,9 @@ void digest2(const uint8_t* data, size_t size, uint8_t raw[32]);
 // AVX2 capability of the running CPU (checked once).
 bool has_avx2();
 
+// Intel SHA extensions (SHA-NI) capability: SSSE3 + SSE4.1 + CPUID.SHA.
+bool has_sha_ni();
+
 // Human readable name of the kernel that scan() uses.
 const char* kernel_name();
 
@@ -75,5 +78,13 @@ int scan_avx2(const Midstate& m, uint32_t start, uint32_t count,
 // Internal: hashes 8 consecutive nonces with the AVX2 kernel.  `digests`
 // receives 8 big-endian 32-byte digests.
 bool hash8_avx2(const Midstate& m, uint32_t start, uint8_t digests[8][32]);
+
+// SHA-NI kernel (defined in sha256_shani.cpp).  `raw` is in wire order, like
+// hash_nonce().  Only call when has_sha_ni() is true.
+bool sha_ni_available();
+void hash_nonce_sha_ni(const Midstate& m, uint32_t nonce, uint8_t raw[32]);
+int scan_sha_ni(const Midstate& m, uint32_t start, uint32_t count,
+                const uint8_t target_be[32], uint32_t* nonces,
+                uint8_t (*digests)[32], int max_out);
 
 }  // namespace sha256

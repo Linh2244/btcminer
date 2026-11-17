@@ -236,17 +236,47 @@ bool detect_avx2() {
 
 const bool kHasAvx2 = detect_avx2();
 
+bool detect_sha_ni() {
+#if defined(_MSC_VER)
+    int regs[4];
+    __cpuid(regs, 1);
+    if (!(regs[2] & (1 << 9))) return false;   // SSSE3
+    if (!(regs[2] & (1 << 19))) return false;  // SSE4.1
+    __cpuid(regs, 0);
+    if (regs[0] < 7) return false;
+    __cpuidex(regs, 7, 0);
+    return (regs[1] & (1 << 29)) != 0;         // SHA
+#else
+    unsigned eax, ebx, ecx, edx;
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return false;
+    if (!(ecx & (1u << 9)) || !(ecx & (1u << 19))) return false;
+    if (__get_cpuid_max(0, nullptr) < 7) return false;
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    return (ebx & (1u << 29)) != 0;
+#endif
+}
+
+const bool kHasShaNi = detect_sha_ni();
+
 }  // namespace
 
 bool has_avx2() { return kHasAvx2; }
 
 bool avx2_available() { return kHasAvx2; }
 
-const char* kernel_name() { return kHasAvx2 ? "avx2 (8 lanes)" : "scalar"; }
+bool has_sha_ni() { return kHasShaNi; }
+
+const char* kernel_name() {
+    if (kHasShaNi) return "sha-ni";
+    return kHasAvx2 ? "avx2 (8 lanes)" : "scalar";
+}
 
 int scan(const Midstate& m, uint32_t start, uint32_t count,
          const uint8_t target_be[32], uint32_t* nonces,
          uint8_t (*digests)[32], int max_out) {
+    if (kHasShaNi) {
+        return scan_sha_ni(m, start, count, target_be, nonces, digests, max_out);
+    }
     if (kHasAvx2) {
         return scan_avx2(m, start, count, target_be, nonces, digests, max_out);
     }

@@ -4,7 +4,7 @@
 
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D4)
 ![Language](https://img.shields.io/badge/C%2B%2B-17-00599C)
-![Kernel](https://img.shields.io/badge/SHA--256d-AVX2%20%7C%20scalar-6E4C13)
+![Kernel](https://img.shields.io/badge/SHA--256d-SHA--NI%20%7C%20AVX2%20%7C%20scalar-6E4C13)
 ![Protocol](https://img.shields.io/badge/Stratum-v1-F7931A)
 ![Binary](https://img.shields.io/badge/binary%20size-2.85%20MB-lightgrey)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-success)
@@ -12,9 +12,9 @@
 ![Release](https://img.shields.io/github/v/release/Linh2244/btcminer)
 
 `btcminer` connects to any Stratum v1 pool, builds the 80-byte block header from
-the pool's job, scans the nonce space with an 8-lane AVX2 SHA-256d kernel, and
-submits shares that meet the pool's target. It is written in C++17 with no
-third-party libraries — only Winsock2.
+the pool's job, scans the nonce space with an SHA-NI or 8-lane AVX2 SHA-256d
+kernel, and submits shares that meet the pool's target. It is written in C++17
+with no third-party libraries — only Winsock2.
 
 > **This is a learning project.** CPU mining has not been profitable for a
 > decade. At the hashrate this miner reaches (~5–20 MH/s), the expected time to
@@ -54,8 +54,10 @@ third-party libraries — only Winsock2.
 - **Single static binary** — `dist/btcminer.exe` is 2.85 MB and depends only on
   Windows system DLLs (`KERNEL32`, `WS2_32`, UCRT). No runtime, no installer, no
   `PATH` setup.
-- **8-lane AVX2 SHA-256d kernel** with runtime CPUID dispatch and a portable
-  scalar fallback, so the same binary runs on CPUs without AVX2.
+- **Three auto-selected hash kernels** — Intel SHA extensions (SHA-NI) on
+  modern CPUs, an 8-lane AVX2 kernel on Haswell/Zen-class CPUs, and a portable
+  scalar fallback. One binary runs everywhere; the fastest available kernel is
+  picked at startup via CPUID.
 - **Midstate caching** — the first 64 bytes of the header are compressed once
   per job; each nonce then costs only two SHA-256 compressions.
 - **Exact 256-bit target math** — `difficulty → target` uses integer division,
@@ -82,7 +84,7 @@ third-party libraries — only Winsock2.
 | Windows 10/11, 64-bit | Tested on Windows 11 23H2 |
 | Internet access | TCP to the pool; plain `stratum+tcp://` only |
 | Pool account | Solo pools use your BTC address as the username |
-| CPU | x86-64. AVX2 is used when available, otherwise the scalar kernel |
+| CPU | x86-64. SHA-NI is used when present, then AVX2, then the scalar kernel |
 
 **To build**
 
@@ -114,7 +116,7 @@ wherever you saved it. Then:
 A healthy session looks like this:
 
 ```
-11:05:38  INFO    btcminer 1.1.0 | pool stratum+tcp://solo.ckpool.org:3333 | worker 1A1z....cpptest | 8 thread(s) | kernel avx2 (8 lanes)
+11:05:38  INFO    btcminer 1.2.0 | pool stratum+tcp://solo.ckpool.org:3333 | worker 1A1z....cpptest | 8 thread(s) | kernel sha-ni
 11:05:43  INFO    authorized | extranonce1=bcaf946e | extranonce2_size=8
 11:05:44  INFO    pool difficulty set to 10000
 11:05:58  INFO    16.93 MH/s | accepted 0 | rejected 0 | best share - | difficulty 10000 | job 6ae40f5a0000d42d
@@ -137,9 +139,10 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Tools
 powershell -ExecutionPolicy Bypass -File .\build.ps1 -Clean
 ```
 
-`build.ps1` compiles every translation unit (`sha256_avx2.cpp` gets `-mavx2`),
-links with `-static -static-libgcc -static-libstdc++ -lws2_32`, then runs the
-binary's self-test and fails the build if it does not pass.
+`build.ps1` compiles every translation unit (`sha256_avx2.cpp` gets `-mavx2`,
+`sha256_shani.cpp` gets `-msha -mssse3 -msse4.1`), links with
+`-static -static-libgcc -static-libstdc++ -lws2_32`, then runs the binary's
+self-test and fails the build if it does not pass.
 
 Equivalent manual build:
 
@@ -148,6 +151,8 @@ New-Item -ItemType Directory -Force build | Out-Null
 
 g++ -O3 -std=c++17 -Wall -Wextra -c cpp/sha256.cpp      -o build/sha256.o
 g++ -O3 -std=c++17 -Wall -Wextra -mavx2 -c cpp/sha256_avx2.cpp -o build/sha256_avx2.o
+g++ -O3 -std=c++17 -Wall -Wextra -msha -mssse3 -msse4.1 `
+    -c cpp/sha256_shani.cpp -o build/sha256_shani.o
 foreach ($s in "util","json","job","stratum","worker","miner","main") {
     g++ -O3 -std=c++17 -Wall -Wextra -c "cpp/$s.cpp" -o "build/$s.o"
 }
@@ -155,7 +160,7 @@ foreach ($s in "util","json","job","stratum","worker","miner","main") {
 g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
     build/util.o build/json.o build/job.o build/stratum.o build/worker.o `
     build/miner.o build/main.o build/sha256.o build/sha256_avx2.o `
-    -o dist/btcminer.exe -lws2_32
+    build/sha256_shani.o -o dist/btcminer.exe -lws2_32
 ```
 
 The build is warning-clean with `-Wall -Wextra`.
@@ -253,6 +258,14 @@ budget and cooling; the scaling is what matters.
 - The kernel is memory-light and scales close to linearly until the power limit
   is hit.
 
+**SHA-NI.** On CPUs with Intel SHA extensions (Goldmont, Ice Lake and newer;
+AMD Zen and newer) the SHA-NI kernel is selected automatically. It runs one
+nonce at a time but completes each compression with `SHA256RNDS2` and
+`SHA256MSG1`/`SHA256MSG2` instead of the 8-wide AVX2 round loop. This test
+machine has no SHA-NI, so no MH/s figure is claimed here; the kernel's output
+and the full mining path are verified against the scalar kernel under Intel SDE
+(`sde -tgl -- .\build\bench.exe`).
+
 ## Testing
 
 ```powershell
@@ -273,8 +286,8 @@ What each test covers:
 
 | Test | What it proves |
 | --- | --- |
-| `--self-test` | Block 125552 hashes to the expected digest (scalar **and** AVX2), difficulty 1/2/0.5 targets are exact, and the worker pool finds and re-verifies real shares |
-| `bench.exe` | Both kernels agree on 4096 random nonces; prints single-thread MH/s per kernel |
+| `--self-test` | Block 125552 hashes to the expected digest (scalar, AVX2 and SHA-NI), difficulty 1/2/0.5 targets are exact, and the worker pool finds and re-verifies real shares |
+| `bench.exe` | Every available kernel agrees with the scalar kernel on 4096 random nonces; prints single-thread MH/s per kernel |
 | `fake_pool_check.py` | The miner's submitted `(job, extranonce2, ntime, nonce)` really hashes below the pool target, using `hashlib`/`struct` instead of the miner's own code |
 | `legacy/tests` | The Python reference implementation still behaves as documented |
 
@@ -345,6 +358,7 @@ to floating point.
 cpp/                    C++17 sources (no third-party code)
   sha256.{h,cpp}        SHA-256, midstate, nonce scan, kernel dispatch
   sha256_avx2.cpp       8-lane AVX2 kernel (compiled with -mavx2)
+  sha256_shani.cpp      SHA-NI kernel (compiled with -msha -mssse3 -msse4.1)
   job.{h,cpp}           mining.notify parsing, coinbase/merkle/header assembly
   stratum.{h,cpp}       newline-delimited JSON-RPC over TCP (Winsock2)
   worker.{h,cpp}        thread pool, nonce ranges, share re-verification
@@ -369,6 +383,11 @@ block is picked up within about a millisecond. Each share carries a
 `shared_ptr<const Work>`, which guarantees the submitted `job_id`/`extranonce2`
 match the midstate that produced it even if a new job arrived meanwhile.
 
+**Kernel dispatch.** CPUID is checked once at startup: SHA-NI if
+`CPUID.7.0:EBX.SHA` is set (and SSSE3/SSE4.1 are present), otherwise AVX2, otherwise
+the scalar kernel. `--self-test` cross-checks every available kernel against the
+scalar one before the miner touches a pool.
+
 **Resilience.** Sessions are re-established with exponential backoff from 2 s to
 60 s (reset after a session lasting longer than 120 s). The Stratum client keeps
 a backlog so notifications pipelined into the same TCP segment as a response are
@@ -382,7 +401,9 @@ the pool goes silent.
 - **No version rolling (BIP310).** The `version` field from the pool is used
   as-is; `mining.set_version_mask` is ignored (logged at debug level).
 - **CPU only.** No GPU/ASIC support; not competitive with dedicated hardware.
-- **No SHA-NI kernel.** CPUs with SHA extensions still use the AVX2 path.
+- **Single-buffer SHA-NI.** The SHA-NI path interleaves rounds within one nonce
+  but does not run several nonces in parallel, so there is still headroom on
+  wide cores.
 - **Windows only.** The transport layer is Winsock2; the hashing core is
   portable but there is no Linux/macOS build script yet.
 - **Solo mining is unrealistic** at this hashrate — expect months of runtime
@@ -399,7 +420,7 @@ the pool goes silent.
 | `share rejected: low difficulty` | Pool changed difficulty mid-job; the next job uses the new target |
 | Every share rejected with `above target` | Byte-order bug (nonce/prevhash/merkle); run `python tests\fake_pool_check.py` |
 | No shares at all | Pool difficulty is far above the local hashrate; confirm with `--self-test` |
-| `kernel scalar` instead of `avx2` in the log | CPU (or VM) lacks AVX2; still correct, roughly 5× slower |
+| `kernel scalar` instead of `sha-ni`/`avx2` in the log | CPU (or VM) lacks SHA-NI/AVX2; still correct, but slower |
 | `g++ not found on PATH` | Install MinGW-w64 (WinLibs) and reopen the terminal |
 | `build.ps1 cannot be loaded ... running scripts is disabled` | `powershell -ExecutionPolicy Bypass -File .\build.ps1` |
 | Antivirus flags the executable | Common false positive for mining binaries; build it yourself or add an exclusion |
