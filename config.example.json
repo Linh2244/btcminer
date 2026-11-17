@@ -1,0 +1,9 @@
+{
+  "url": "stratum+tcp://solo.ckpool.org:3333",
+  "user": "YOUR_BTC_ADDRESS.worker1",
+  "password": "x",
+  "processes": 4,
+  "stats_interval": 30,
+  "idle_timeout": 300,
+  "log_level": "INFO"
+}

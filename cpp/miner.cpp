@@ -1,0 +1,547 @@
+﻿#include "miner.h"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <random>
+#include <thread>
+
+#include "util.h"
+
+namespace {
+
+//: Difficulty assumed if a pool sends a job before mining.set_difficulty.
+constexpr double kDefaultDifficulty = 1.0;
+constexpr const char* kVersion = "1.1.0";
+
+std::string lower_ascii(std::string text) {
+    for (char& c : text) c = char(std::tolower((unsigned char)c));
+    return text;
+}
+
+std::string json_error_text(const Json& error) {
+    if (error.is_string()) return error.as_string();
+    if (error.is_array() && error.size() > 1 && error[1].is_string()) {
+        return error[1].as_string();
+    }
+    return error.dump();
+}
+
+}  // namespace
+
+Miner::Miner(MinerConfig config)
+    : config_(std::move(config)),
+      pool_(config_.threads, config_.has_seed ? config_.seed
+                                              : std::random_device{}()) {
+    if (config_.user_agent.empty()) {
+        config_.user_agent = std::string("btcminer-cpp/") + kVersion;
+    }
+    if (config_.threads < 1) config_.threads = 1;
+    raw_notify_ = Json::make_array();
+}
+
+Miner::~Miner() { pool_.stop(); }
+
+void Miner::run() {
+    started_at_ = util::now_seconds();
+    util::log().info("btcminer %s | pool %s | worker %s | %d thread(s) | kernel %s",
+                     kVersion, config_.url.c_str(), config_.user.c_str(),
+                     config_.threads, sha256::kernel_name());
+    pool_.start();
+    double backoff = 2.0;
+    try {
+        while (!stop_.load() && !time_exceeded()) {
+            double session_started = util::now_seconds();
+            try {
+                session();
+            } catch (const std::exception& error) {
+                util::log().warn("%s", error.what());
+            }
+            close_session();
+            if (stop_.load() || time_exceeded()) break;
+            if (util::now_seconds() - session_started > 120.0) backoff = 2.0;
+            util::log().info("reconnecting in %.0f s", backoff);
+            sleep_interruptible(backoff);
+            backoff = std::min(backoff * 2.0, 60.0);
+        }
+    } catch (...) {
+        pool_.stop();
+        throw;
+    }
+    pool_.stop();
+    print_summary();
+}
+
+void Miner::benchmark(double seconds) {
+    util::log().info(
+        "benchmark mode: hashing locally for %.0f s with %d thread(s), kernel %s",
+        seconds, config_.threads, sha256::kernel_name());
+    pool_.start();
+
+    auto work = std::make_shared<Work>();
+    work->generation = 1;
+    uint8_t random_prefix[76];
+    std::vector<uint8_t> noise = util::random_bytes(76);
+    std::memcpy(random_prefix, noise.data(), 76);
+    uint8_t full[80];
+    std::memcpy(full, random_prefix, 76);
+    std::memset(full + 76, 0, 4);
+    sha256::build_midstate(work->mid, full);
+    // Impossible target: no share is ever found.
+    std::memset(work->target, 0, 32);
+    work->job_id = "benchmark";
+    work->ntime_hex = "00000000";
+    pool_.publish(work);
+
+    double start = util::now_seconds();
+    double warm_at = -1.0;
+    uint64_t warm_hashes = 0;
+    double last_report = start;
+
+    while (!stop_.load()) {
+        double now = util::now_seconds();
+        if (now - start >= seconds) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        now = util::now_seconds();
+        if (warm_at < 0.0 && now - start >= std::min(1.5, seconds / 2.0)) {
+            warm_at = now;
+            warm_hashes = pool_.hashes();
+        }
+        if (warm_at >= 0.0 && now - last_report >= 5.0) {
+            last_report = now;
+            double rate = double(pool_.hashes() - warm_hashes) /
+                          std::max(now - warm_at, 1e-9);
+            util::log().info("benchmark: %s", util::format_hashrate(rate).c_str());
+        }
+    }
+
+    double end = util::now_seconds();
+    pool_.stop();
+    double base = warm_at >= 0.0 ? warm_at : start;
+    uint64_t base_hashes = warm_at >= 0.0 ? warm_hashes : 0;
+    uint64_t total = pool_.hashes();
+    double elapsed = std::max(end - base, 1e-9);
+    util::log().info(
+        "benchmark result: %s average over %.1f s (%llu hashes, %d thread(s))",
+        util::format_hashrate(double(total - base_hashes) / elapsed).c_str(),
+        elapsed, (unsigned long long)total, config_.threads);
+}
+
+// ---------------------------------------------------------------------------
+// session
+// ---------------------------------------------------------------------------
+void Miner::session() {
+    PoolUrl url;
+    std::string error;
+    if (!parse_url(config_.url, url, error)) {
+        throw StratumError("invalid pool URL: " + error);
+    }
+
+    util::log().info("connecting to %s:%u (%s)", url.host.c_str(),
+                     unsigned(url.port), url.scheme.c_str());
+    client_ = std::make_unique<StratumClient>(url.host, url.port);
+    client_->connect();
+
+    Json subscribe_params = Json::make_array();
+    subscribe_params.push(Json::make_string(config_.user_agent));
+    Json result = client_->request("mining.subscribe", subscribe_params, 30.0);
+    apply_subscription(result);
+
+    if (config_.has_suggest && config_.suggest_difficulty > 0.0) {
+        Json suggest = Json::make_array();
+        suggest.push(Json::make_number(config_.suggest_difficulty));
+        try {
+            client_->request("mining.suggest_difficulty", suggest, 5.0);
+        } catch (const StratumError& exc) {
+            util::log().debug("pool ignored suggest_difficulty: %s", exc.what());
+        }
+    }
+
+    Json auth_params = Json::make_array();
+    auth_params.push(Json::make_string(config_.user));
+    auth_params.push(Json::make_string(config_.password));
+    Json authorized = client_->request("mining.authorize", auth_params, 30.0);
+    if (!authorized.is_bool() || !authorized.as_bool()) {
+        throw StratumError("pool refused the worker credentials (" +
+                           config_.user + ")");
+    }
+
+    util::log().info("authorized | extranonce1=%s | extranonce2_size=%d",
+                     extranonce1_.empty() ? "-"
+                                         : util::hex_encode(extranonce1_).c_str(),
+                     int(extranonce2_size_));
+
+    // Fire and forget: most pools never answer this one.
+    try {
+        Json empty = Json::make_array();
+        client_->send_request("mining.extranonce.subscribe", empty);
+    } catch (const std::exception& exc) {
+        util::log().debug("could not enable extranonce subscription: %s",
+                          exc.what());
+    }
+
+    double now = util::now_seconds();
+    last_rx_ = now;
+    last_stats_ = now;
+    samples_.clear();
+    samples_.emplace_back(now, pool_.hashes());
+
+    while (!stop_.load() && !time_exceeded()) {
+        std::vector<Json> messages = client_->poll(0.5);
+        std::vector<Json> backlog = client_->take_backlog();
+        if (!messages.empty() || !backlog.empty()) {
+            last_rx_ = util::now_seconds();
+        }
+        // Older backlog messages first: they arrived before this read.
+        for (const Json& message : backlog) handle_message(message);
+        for (const Json& message : messages) handle_message(message);
+
+        for (const Share& share : pool_.drain_shares()) on_share(share);
+        stats_tick();
+
+        if (util::now_seconds() - last_rx_ > config_.idle_timeout) {
+            throw StratumDisconnected("no data from pool for " +
+                                      std::to_string(int(config_.idle_timeout)) +
+                                      " s");
+        }
+    }
+}
+
+void Miner::close_session() {
+    pool_.clear();
+    if (client_) {
+        client_->close();
+        client_.reset();
+    }
+    if (!pending_.empty()) {
+        util::log().warn("%zu submitted share(s) still unconfirmed",
+                         pending_.size());
+        pending_.clear();
+    }
+}
+
+void Miner::apply_subscription(const Json& result) {
+    if (!result.is_array() || result.size() < 3) {
+        throw StratumError("unexpected mining.subscribe result: " + result.dump());
+    }
+    const Json& extranonce1 = result[1];
+    if (!extranonce1.is_string()) {
+        throw StratumError("pool did not provide an extranonce1");
+    }
+    std::vector<uint8_t> decoded;
+    std::string detail;
+    if (!util::hex_decode(extranonce1.as_string(), decoded, std::string::npos,
+                          &detail)) {
+        throw StratumError("invalid extranonce1: " + detail);
+    }
+    extranonce1_ = std::move(decoded);
+
+    const Json& size = result[2];
+    long long value = size.is_number() ? size.as_int(-1) : -1;
+    if (value < 0 || value > 32) {
+        throw StratumError("invalid extranonce2 size: " + size.dump());
+    }
+    extranonce2_size_ = size_t(value);
+    util::log().debug("subscriptions: %s", result[0].dump().c_str());
+    work_key_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// pool messages
+// ---------------------------------------------------------------------------
+void Miner::handle_message(const Json& message) {
+    if (!message.is_object()) return;
+
+    const Json* method = message.find("method");
+    if (method && method->is_string() && !method->as_string().empty()) {
+        const std::string& name = method->as_string();
+        Json empty_params = Json::make_array();
+        const Json* params_ptr = message.find("params");
+        const Json& params =
+            (params_ptr && params_ptr->is_array()) ? *params_ptr : empty_params;
+
+        if (name == "mining.notify") {
+            on_notify(params);
+        } else if (name == "mining.set_difficulty") {
+            on_set_difficulty(params);
+        } else if (name == "mining.set_extranonce") {
+            on_set_extranonce(params);
+        } else if (name == "client.get_version") {
+            const Json* id = message.find("id");
+            if (id && client_) {
+                client_->respond(*id, Json::make_string(config_.user_agent));
+            }
+        } else if (name == "client.show_message") {
+            util::log().info("pool message: %s",
+                             params.size() ? params[0].as_string().c_str() : "");
+        } else if (name == "client.reconnect") {
+            throw StratumDisconnected("pool requested a reconnect");
+        } else if (name == "mining.set_version_mask" || name == "mining.ping" ||
+                   name == "mining.set_goal") {
+            util::log().debug("ignoring %s: %s", name.c_str(),
+                              params.dump().c_str());
+        } else {
+            util::log().debug("unhandled pool method %s: %s", name.c_str(),
+                              params.dump().c_str());
+        }
+        return;
+    }
+
+    const Json* id = message.find("id");
+    if (id && id->is_number()) {
+        auto it = pending_.find(id->as_int());
+        if (it != pending_.end()) {
+            pending_.erase(it);
+            on_submit_response(id->as_int(), message);
+            return;
+        }
+    }
+
+    const Json* error = message.find("error");
+    if (error && !error->is_null()) {
+        util::log().warn("pool error: %s", error->dump().c_str());
+    }
+}
+
+void Miner::on_notify(const Json& params) {
+    if (!have_difficulty_) {
+        if (!warned_default_difficulty_) {
+            util::log().info(
+                "job arrived before the first mining.set_difficulty, "
+                "using difficulty %g until the pool sends one",
+                kDefaultDifficulty);
+            warned_default_difficulty_ = true;
+        }
+        set_difficulty(kDefaultDifficulty);
+    }
+
+    Job parsed;
+    std::string error;
+    if (!parse_notify(params, extranonce1_, extranonce2_size_, parsed, error)) {
+        util::log().error("bad mining.notify: %s", error.c_str());
+        return;
+    }
+
+    raw_notify_ = params;
+    job_ = std::move(parsed);
+    have_job_ = true;
+    extranonce2_ = util::random_bytes(extranonce2_size_);
+    if (job_.clean) {
+        util::log().debug("clean job %s", job_.id.c_str());
+    }
+    publish_work();
+}
+
+void Miner::on_set_difficulty(const Json& params) {
+    if (params.size() < 1) {
+        util::log().warn("empty mining.set_difficulty");
+        return;
+    }
+    const Json& value = params[0];
+    double difficulty = value.is_number() ? value.as_double()
+                                          : std::strtod(value.as_string().c_str(),
+                                                        nullptr);
+    if (!(difficulty > 0.0)) {
+        util::log().warn("bad mining.set_difficulty: %s", params.dump().c_str());
+        return;
+    }
+
+    uint8_t previous[32];
+    std::memcpy(previous, target_, 32);
+    bool was_set = have_difficulty_;
+    set_difficulty(difficulty);
+    if (was_set && std::memcmp(previous, target_, 32) == 0) {
+        util::log().debug("pool repeated difficulty %s, nothing to do",
+                          util::format_difficulty(difficulty).c_str());
+        return;
+    }
+    util::log().info("pool difficulty set to %s",
+                     util::format_difficulty(difficulty).c_str());
+    if (have_job_) publish_work();
+}
+
+void Miner::on_set_extranonce(const Json& params) {
+    if (params.size() < 2) {
+        util::log().warn("bad mining.set_extranonce: %s", params.dump().c_str());
+        return;
+    }
+    std::vector<uint8_t> decoded;
+    std::string detail;
+    if (!util::hex_decode(params[0].is_string() ? params[0].as_string() : "",
+                          decoded, std::string::npos, &detail)) {
+        util::log().warn("bad mining.set_extranonce: %s", detail.c_str());
+        return;
+    }
+    long long size = params[1].is_number() ? params[1].as_int(-1) : -1;
+    if (size < 0 || size > 32) {
+        util::log().warn("bad mining.set_extranonce: invalid size");
+        return;
+    }
+    extranonce1_ = std::move(decoded);
+    extranonce2_size_ = size_t(size);
+
+    util::log().info("extranonce changed | extranonce1=%s | extranonce2_size=%d",
+                     extranonce1_.empty() ? "-"
+                                         : util::hex_encode(extranonce1_).c_str(),
+                     int(extranonce2_size_));
+    work_key_.clear();
+    if (!raw_notify_.is_null()) on_notify(raw_notify_);
+}
+
+void Miner::set_difficulty(double difficulty) {
+    difficulty_ = difficulty;
+    have_difficulty_ = true;
+    util::difficulty_to_target(difficulty, target_);
+}
+
+// ---------------------------------------------------------------------------
+// shares
+// ---------------------------------------------------------------------------
+void Miner::publish_work() {
+    if (!have_job_ || !have_difficulty_) return;
+
+    auto work = std::make_shared<Work>();
+    uint8_t header76[76];
+    uint8_t full[80];
+    try {
+        build_header_prefix(job_, extranonce2_, header76);
+        std::memcpy(full, header76, 76);
+        std::memset(full + 76, 0, 4);
+        sha256::build_midstate(work->mid, full);
+    } catch (const std::exception& error) {
+        util::log().error("cannot build block header: %s", error.what());
+        return;
+    }
+    util::log().debug("header %s", util::hex_encode(header76, 76).c_str());
+    work->generation = ++generation_;
+    std::memcpy(work->target, target_, 32);
+    work->job_id = job_.id;
+    work->ntime_hex = job_.ntime_hex;
+    work->extranonce2_hex = util::hex_encode(extranonce2_);
+    work->difficulty = difficulty_;
+
+    std::string key = job_.id + "|" + work->extranonce2_hex + "|" +
+                      util::hex_encode(target_, 32) + "|" + job_.ntime_hex;
+    if (key == work_key_) return;
+    work_key_ = key;
+
+    pool_.publish(work);
+    util::log().debug("job %s published | difficulty %s | extranonce2 %s",
+                      job_.id.c_str(),
+                      util::format_difficulty(difficulty_).c_str(),
+                      work->extranonce2_hex.empty()
+                          ? "-"
+                          : work->extranonce2_hex.c_str());
+}
+
+void Miner::on_share(const Share& share) {
+    uint8_t raw[32];
+    uint8_t be[32];
+    sha256::hash_nonce_scalar(share.work->mid, share.nonce, raw);
+    for (int i = 0; i < 32; ++i) be[i] = raw[31 - i];
+    double share_difficulty = util::target_to_difficulty(be);
+
+    ++shares_found_;
+    best_difficulty_ = std::max(best_difficulty_, share_difficulty);
+    util::log().info(
+        "share found | worker %d | job %s | nonce %s | difficulty %s",
+        share.thread, share.work->job_id.c_str(),
+        util::format_nonce(share.nonce).c_str(),
+        util::format_difficulty(share_difficulty).c_str());
+
+    if (!client_) {
+        util::log().warn("no active pool connection, share dropped");
+        return;
+    }
+
+    Json params = Json::make_array();
+    params.push(Json::make_string(config_.user));
+    params.push(Json::make_string(share.work->job_id));
+    params.push(Json::make_string(share.work->extranonce2_hex));
+    params.push(Json::make_string(share.work->ntime_hex));
+    params.push(Json::make_string(util::format_nonce(share.nonce)));
+
+    int id = client_->send_request("mining.submit", params);
+    pending_[id] = PendingShare{share_difficulty, share.work->job_id};
+}
+
+void Miner::on_submit_response(long long id, const Json& message) {
+    (void)id;
+    const Json* result = message.find("result");
+    if (result && result->is_bool() && result->as_bool()) {
+        ++accepted_;
+        util::log().info("share accepted | accepted %llu / rejected %llu",
+                         (unsigned long long)accepted_,
+                         (unsigned long long)rejected_);
+        return;
+    }
+    ++rejected_;
+    std::string text = "no reason given";
+    const Json* error = message.find("error");
+    if (error && !error->is_null()) text = json_error_text(*error);
+    std::string lowered = lower_ascii(text);
+    if (lowered.find("stale") != std::string::npos ||
+        lowered.find("job not found") != std::string::npos) {
+        ++stale_;
+    }
+    util::log().warn("share rejected: %s", text.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// stats
+// ---------------------------------------------------------------------------
+void Miner::stats_tick() {
+    double now = util::now_seconds();
+    double interval = std::max(5.0, config_.stats_interval);
+    if (now - last_stats_ < interval) return;
+    last_stats_ = now;
+
+    uint64_t total = pool_.hashes();
+    samples_.emplace_back(now, total);
+    while (samples_.size() > 2 && now - samples_.front().first > interval * 3.0) {
+        samples_.pop_front();
+    }
+    double t0 = samples_.front().first;
+    uint64_t h0 = samples_.front().second;
+    double rate = double(total - h0) / std::max(now - t0, 1e-9);
+
+    util::log().info(
+        "%s | accepted %llu | rejected %llu | best share %s | difficulty %s | job %s",
+        util::format_hashrate(rate).c_str(),
+        (unsigned long long)accepted_, (unsigned long long)rejected_,
+        best_difficulty_ > 0.0
+            ? util::format_difficulty(best_difficulty_).c_str()
+            : "-",
+        have_difficulty_ ? util::format_difficulty(difficulty_).c_str() : "-",
+        have_job_ ? job_.id.substr(0, 16).c_str() : "-");
+}
+
+void Miner::print_summary() {
+    double elapsed = std::max(util::now_seconds() - started_at_, 1e-9);
+    uint64_t total = pool_.hashes();
+    util::log().info(
+        "stopped | %s average | %llu hashes | %llu share(s) found | %llu accepted | "
+        "%llu rejected | best share %s",
+        util::format_hashrate(double(total) / elapsed).c_str(),
+        (unsigned long long)total, (unsigned long long)shares_found_,
+        (unsigned long long)accepted_, (unsigned long long)rejected_,
+        best_difficulty_ > 0.0
+            ? util::format_difficulty(best_difficulty_).c_str()
+            : "-");
+}
+
+bool Miner::time_exceeded() const {
+    if (!config_.has_duration) return false;
+    return util::now_seconds() - started_at_ >= config_.duration;
+}
+
+void Miner::sleep_interruptible(double seconds) {
+    double deadline = util::now_seconds() + seconds;
+    while (!stop_.load() && util::now_seconds() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+

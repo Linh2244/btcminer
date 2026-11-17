@@ -1,0 +1,19 @@
+# Build intermediates
+build/
+
+# Local configuration (pool URL + worker name)
+config.json
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
