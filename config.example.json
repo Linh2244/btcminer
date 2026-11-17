@@ -5,5 +5,25 @@
   "processes": 4,
   "stats_interval": 30,
   "idle_timeout": 300,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "pools": [
+    {
+      "url": "stratum+tcp://solo.ckpool.org:3333"
+    },
+    {
+      "url": "stratum+ssl://backup.example.net:443"
+    }
+  ],
+  "version_rolling": true,
+  "tls_verify": true,
+  "api": {
+    "enabled": true,
+    "bind": "127.0.0.1",
+    "port": 4068
+  },
+  "cpu": {
+    "affinity": "0-3",
+    "priority": "normal",
+    "limit": 100
+  }
 }

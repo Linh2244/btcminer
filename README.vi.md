@@ -6,8 +6,9 @@ Phần mềm đào BTC viết bằng **C++17**, kết nối tới pool qua **Str
 (`mining.subscribe` / `mining.authorize` / `mining.notify` / `mining.submit`),
 tính block header, tìm nonce thoả mãn target của pool và gửi share về pool.
 
-* **Một file `.exe` duy nhất**, biên dịch tĩnh: không cần runtime, không cần
-  thư viện ngoài (chỉ Winsock2 của Windows).
+* **Một file `.exe` duy nhất**, biên dịch tĩnh; chỉ dùng thư viện hệ thống của
+  Windows (`KERNEL32`, `WS2_32`, `SECUR32`, `CRYPT32`, UCRT), không có runtime
+  hay thư viện bên thứ ba.
 * **Ba kernel băm tự chọn**: SHA-NI trên CPU đời mới, AVX2 8 làn trên CPU
   Haswell/Zen, và kernel scalar dự phòng (tự phát hiện bằng CPUID) cùng
   **midstate**: 64 byte đầu của header chỉ băm một lần cho mỗi job, mỗi nonce
@@ -15,6 +16,10 @@ tính block header, tìm nonce thoả mãn target của pool và gửi share v�
 * Đa luồng bằng `std::thread` (mặc định = số CPU luận lý) để tận dụng mọi core.
 * Tự động xử lý: `mining.set_difficulty`, `mining.set_extranonce`,
   `client.get_version`, `client.reconnect`, mất kết nối (reconnect + backoff).
+* Hỗ trợ pool TLS qua SChannel với kiểm tra chứng chỉ và hostname mặc định,
+  version rolling BIP310, failover nhiều pool theo thứ tự.
+* API trạng thái HTTP cục bộ tại `127.0.0.1:4068` (`/status`, `/healthz`) và
+  điều khiển affinity, mức ưu tiên, giới hạn duty-cycle CPU gần đúng.
 * Có `--self-test` (kiểm tra thuật toán bằng vector chuẩn của Bitcoin),
   `--benchmark` (đo hashrate, không cần pool) và bộ test đầu-cuối với pool giả.
 
@@ -62,7 +67,7 @@ lệnh luôn ghi đè file cấu hình.
 
 ## 2.1. Bản chạy sẵn: `dist\btcminer.exe`
 
-Không cần cài gì cả — dùng file đã build sẵn **`dist\btcminer.exe`** (~2.9 MB,
+Không cần cài gì cả — dùng file đã build sẵn **`dist\btcminer.exe`** (~3 MB,
 một file, biên dịch tĩnh, không cần runtime). Bản phát hành chính thức kèm file
 tải về nằm ở [GitHub Releases](https://github.com/Linh2244/btcminer/releases/latest):
 
@@ -83,6 +88,8 @@ tải về nằm ở [GitHub Releases](https://github.com/Linh2244/btcminer/rele
 * **Cảnh báo antivirus:** file `.exe` đào coin đôi khi bị Windows
   Defender/SmartScreen báo nhầm. Đây là false positive; nếu tin tưởng mã nguồn,
   hãy thêm file vào danh sách loại trừ hoặc tự build từ mã nguồn (mục 2.2).
+* Asset phát hành được đặt tên theo phiên bản, ví dụ:
+  `btcminer-v1.3.0-windows-x64.exe`.
 
 ### 2.2. Tự build lại exe
 
@@ -93,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1        # -> dist\btcminer.e
 
 Script sẽ biên dịch từng file (`sha256_avx2.cpp` dùng `-mavx2`,
 `sha256_shani.cpp` dùng `-msha -mssse3 -msse4.1`), link
-tĩnh với `-static -static-libgcc -static-libstdc++ -lws2_32` rồi **tự chạy
+tĩnh với `-static -static-libgcc -static-libstdc++ -lws2_32 -lsecur32 -lcrypt32` rồi **tự chạy
 `--self-test`**. Các tuỳ chọn:
 
 | Tuỳ chọn | Tác dụng |
@@ -107,13 +114,14 @@ Hoặc gọi `g++` trực tiếp:
 g++ -O3 -std=c++17 -c cpp/sha256.cpp      -o build/sha256.o
 g++ -O3 -std=c++17 -mavx2 -c cpp/sha256_avx2.cpp -o build/sha256_avx2.o
 g++ -O3 -std=c++17 -msha -mssse3 -msse4.1 -c cpp/sha256_shani.cpp -o build/sha256_shani.o
-foreach ($s in "util","json","job","stratum","worker","miner","main") {
-    g++ -O3 -std=c++17 -c "cpp/$s.cpp" -o "build/$s.o"
+foreach ($s in "util","json","job","stratum","tls","http","worker","miner","cpu","main") {
+    g++ -O3 -std=c++17 -Wall -Wextra -c "cpp/$s.cpp" -o "build/$s.o"
 }
 g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
-    build/util.o build/json.o build/job.o build/stratum.o build/worker.o `
-    build/miner.o build/main.o build/sha256.o build/sha256_avx2.o `
-    build/sha256_shani.o -o dist/btcminer.exe -lws2_32
+    build/util.o build/json.o build/job.o build/stratum.o build/tls.o `
+    build/http.o build/worker.o build/miner.o build/cpu.o build/main.o `
+    build/sha256.o build/sha256_avx2.o build/sha256_shani.o `
+    -o dist/btcminer.exe -lws2_32 -lsecur32 -lcrypt32
 ```
 
 > Máy nào tắt script (Execution Policy) thì dùng
@@ -124,16 +132,24 @@ g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
 
 | Khoá trong `config.json` | Ý nghĩa | Mặc định |
 | --- | --- | --- |
-| `url` | URL pool `stratum+tcp://host:port` | — |
+| `url` | URL pool TCP/TLS (`stratum+tcp://`, `stratum+ssl://`, `stratum+tls://`) | — |
 | `user` | worker name, thường là `<địa chỉ BTC>.<tên worker>` | — |
 | `password` | mật khẩu worker (hầu hết pool bỏ qua) | `"x"` |
-| `processes` | số thread đào (giữ tên cũ cho tương thích bản Python) | số CPU luận lý |
+| `processes` | số thread đào (giữ tên cũ cho tương thích bản Python) | số CPU luận lý, hoặc số CPU đã chọn bằng affinity |
 | `stats_interval` | giây giữa các lần in hashrate | `30` |
 | `idle_timeout` | reconnect nếu pool im lặng quá N giây | `300` |
 | `log_level` | `DEBUG` / `INFO` / `WARNING` / `ERROR` | `INFO` |
 | `duration` | tự dừng sau N giây (tiện test) | không giới hạn |
 | `suggest_difficulty` | gợi ý difficulty cho pool | không gửi |
 | `seed` | seed RNG (nonce bắt đầu lặp lại được) | ngẫu nhiên |
+| `pools` | danh sách pool theo thứ tự; mục đầu là pool chính | `url` cấp cao nhất |
+| `version_rolling` | bật đàm phán BIP310 | `true` |
+| `tls_verify` | kiểm tra chuỗi chứng chỉ và hostname TLS; chỉ tắt khi kiểm thử | `true` |
+| `api.enabled` | bật API trạng thái cục bộ | `true` |
+| `api.bind`, `api.port` | địa chỉ và cổng API | `127.0.0.1`, `4068` |
+| `cpu.affinity` | danh sách CPU như `"0-3,6"` hoặc mask hex | tất cả CPU |
+| `cpu.priority` | `idle`, `below`, `normal`, `above`, `high`, `realtime` | `normal` |
+| `cpu.limit` | duty-cycle CPU gần đúng, 1–100% | `100` |
 
 ## 4. Tuỳ chọn dòng lệnh
 
@@ -143,10 +159,10 @@ g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
 
 | Tuỳ chọn | Mô tả |
 | --- | --- |
-| `-o, --url` | URL pool (`stratum+tcp://host:port`, hoặc `host:port`) |
+| `-o, --url` | URL pool TCP/TLS (`stratum+tcp://`, `stratum+ssl://`, `stratum+tls://`, `ssl://`, `tls://` hoặc `host:port`) |
 | `-u, --user` | worker name / địa chỉ |
 | `-p, --password` | mật khẩu worker |
-| `-t, --processes` | số thread đào |
+| `-t, --processes` | số thread đào (mặc định theo số CPU affinity nếu có) |
 | `-c, --config` | file JSON cấu hình |
 | `--duration` | dừng sau N giây |
 | `--stats-interval` | chu kỳ in hashrate |
@@ -157,7 +173,19 @@ g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
 | `--benchmark [N]` | đo hashrate N giây (mặc định 30) |
 | `--self-test` | kiểm tra thuật toán rồi thoát |
 | `--log-level` | mức log |
+| `--api-bind HOST:PORT` | địa chỉ API (mặc định `127.0.0.1:4068`) |
+| `--no-api` | tắt API trạng thái |
+| `--affinity LIST` | CPU worker, ví dụ `0-3,6` hoặc mask `0xF` |
+| `--priority LEVEL` | mức ưu tiên process/thread |
+| `--cpu-limit N` | duty-cycle CPU gần đúng, từ 1 đến 100% |
+| `--tls-insecure` | bỏ kiểm tra chứng chỉ TLS (chỉ dùng khi kiểm thử) |
+| `--no-version-rolling` | tắt BIP310 version rolling |
 | `--version` | in phiên bản |
+
+API không có xác thực; nên giữ bind loopback mặc định. Nếu khai báo `pools`,
+các pool phía sau được thử sau hai lần kết nối thất bại liên tiếp. Cấu hình
+`url`, `user`, `password` cấp cao nhất vẫn dùng được như trước. Nếu không bind
+được API, miner chỉ cảnh báo rồi tiếp tục đào.
 
 Ví dụ chạy nền, ghi log ra file (PowerShell):
 
@@ -177,6 +205,12 @@ Ví dụ chạy nền, ghi log ra file (PowerShell):
 # test đầu-cuối với pool giả (pool tự dựng lại header để xác nhận share)
 python tests/fake_pool_check.py
 
+# kiểm tra BIP310, TLS/SNI và API trạng thái
+python tests/fake_pool_check.py --version-rolling
+python tests/fake_pool_check.py --tls --version-rolling
+python tests/fake_pool_check.py --failover
+python tests/fake_pool_check.py --status-api
+
 # bộ unittest của bản Python tham khảo (trong legacy/)
 cd legacy; python -m unittest discover -v; cd ..
 ```
@@ -195,6 +229,8 @@ Bộ test gồm:
   header bằng công thức độc lập** (`hashlib`, `struct.pack`) để xác nhận share
   hợp lệ — nhờ vậy lỗi endianness sẽ bị phát hiện. Lần chạy gần nhất:
   3383/3383 share hợp lệ, 0 share sai.
+* Kiểm thử TLS tạo chứng chỉ cục bộ và cần thêm gói Python `cryptography`;
+  đây chỉ là phụ thuộc của test, không phải của file `.exe`.
 * **Target math**: `difficulty -> target` dùng phép chia số nguyên 256-bit nên
   khớp chính xác với giá trị `floor(0xFFFF * 2^208 / difficulty)`.
 

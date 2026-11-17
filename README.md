@@ -7,7 +7,7 @@
 ![Kernel](https://img.shields.io/badge/SHA--256d-SHA--NI%20%7C%20AVX2%20%7C%20scalar-6E4C13)
 ![Protocol](https://img.shields.io/badge/Stratum-v1-F7931A)
 ![Binary](https://img.shields.io/badge/binary%20size-2.85%20MB-lightgrey)
-![Dependencies](https://img.shields.io/badge/dependencies-none-success)
+![Third-party dependencies](https://img.shields.io/badge/third--party%20dependencies-none-success)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Release](https://img.shields.io/github/v/release/Linh2244/btcminer)
 
@@ -51,9 +51,9 @@ with no third-party libraries — only Winsock2.
 
 ## Features
 
-- **Single static binary** — `dist/btcminer.exe` is 2.85 MB and depends only on
-  Windows system DLLs (`KERNEL32`, `WS2_32`, UCRT). No runtime, no installer, no
-  `PATH` setup.
+- **Single static binary** — one Windows x64 `.exe`, statically linked to the
+  C++ runtime and using only Windows system DLLs (`KERNEL32`, `WS2_32`,
+  `SECUR32`, `CRYPT32`, UCRT). No third-party runtime or installer.
 - **Three auto-selected hash kernels** — Intel SHA extensions (SHA-NI) on
   modern CPUs, an 8-lane AVX2 kernel on Haswell/Zen-class CPUs, and a portable
   scalar fallback. One binary runs everywhere; the fastest available kernel is
@@ -71,6 +71,14 @@ with no third-party libraries — only Winsock2.
   `mining.set_extranonce`, `mining.suggest_difficulty`, `client.get_version`,
   `client.reconnect`, `client.show_message`, idle timeout, reconnect with
   exponential backoff.
+- **TLS pools** through Windows SChannel, with certificate-chain and hostname
+  verification enabled by default.
+- **BIP310 version rolling** when the pool negotiates the extension.
+- **Ordered multi-pool failover** after consecutive connection failures.
+- **Local HTTP status API** at `127.0.0.1:4068` by default, with `/status` and
+  `/healthz`.
+- **CPU controls** for worker affinity, priority and approximate duty-cycle
+  limits.
 - **Self-contained tooling**: `--self-test` (known-answer vectors, target math,
   a short live mine), `--benchmark` (hashrate without a pool), plus a fake-pool
   end-to-end test that rebuilds every submitted header with independent code.
@@ -82,22 +90,24 @@ with no third-party libraries — only Winsock2.
 | Item | Notes |
 | --- | --- |
 | Windows 10/11, 64-bit | Tested on Windows 11 23H2 |
-| Internet access | TCP to the pool; plain `stratum+tcp://` only |
+| Internet access | TCP or TLS to the pool (`stratum+tcp://`, `stratum+ssl://`, or `stratum+tls://`) |
 | Pool account | Solo pools use your BTC address as the username |
 | CPU | x86-64. SHA-NI is used when present, then AVX2, then the scalar kernel |
+| Status API | Optional; loopback-only by default and unauthenticated |
 
 **To build**
 
 | Item | Notes |
 | --- | --- |
 | MinGW-w64 `g++` | Tested with WinLibs g++ 16.1.0 (UCRT). No CMake, no Visual Studio, no Python |
-| `-lws2_32` | Ships with MinGW-w64 |
+| Windows libraries | `-lws2_32 -lsecur32 -lcrypt32` (Winsock2 and SChannel) |
 
 ## Quick start
 
-Grab the prebuilt Windows binary (`btcminer-<version>-windows-x64.exe`) from the
-[latest release](https://github.com/Linh2244/btcminer/releases/latest), or build
-it yourself (see below). The commands use the source-checkout path
+Grab the prebuilt Windows binary (`btcminer-v<version>-windows-x64.exe`) from
+the [latest release](https://github.com/Linh2244/btcminer/releases/latest)
+(the 1.3.0 asset is `btcminer-v1.3.0-windows-x64.exe`), or build it yourself
+(see below). The commands use the source-checkout path
 `.\dist\btcminer.exe`; a downloaded release is a single file, so run it from
 wherever you saved it. Then:
 
@@ -141,8 +151,8 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1 -Clean
 
 `build.ps1` compiles every translation unit (`sha256_avx2.cpp` gets `-mavx2`,
 `sha256_shani.cpp` gets `-msha -mssse3 -msse4.1`), links with
-`-static -static-libgcc -static-libstdc++ -lws2_32`, then runs the binary's
-self-test and fails the build if it does not pass.
+`-static -static-libgcc -static-libstdc++ -lws2_32 -lsecur32 -lcrypt32`, then
+runs the binary's self-test and fails the build if it does not pass.
 
 Equivalent manual build:
 
@@ -153,14 +163,15 @@ g++ -O3 -std=c++17 -Wall -Wextra -c cpp/sha256.cpp      -o build/sha256.o
 g++ -O3 -std=c++17 -Wall -Wextra -mavx2 -c cpp/sha256_avx2.cpp -o build/sha256_avx2.o
 g++ -O3 -std=c++17 -Wall -Wextra -msha -mssse3 -msse4.1 `
     -c cpp/sha256_shani.cpp -o build/sha256_shani.o
-foreach ($s in "util","json","job","stratum","worker","miner","main") {
+foreach ($s in "util","json","job","stratum","tls","http","worker","miner","cpu","main") {
     g++ -O3 -std=c++17 -Wall -Wextra -c "cpp/$s.cpp" -o "build/$s.o"
 }
 
 g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
-    build/util.o build/json.o build/job.o build/stratum.o build/worker.o `
-    build/miner.o build/main.o build/sha256.o build/sha256_avx2.o `
-    build/sha256_shani.o -o dist/btcminer.exe -lws2_32
+    build/util.o build/json.o build/job.o build/stratum.o build/tls.o `
+    build/http.o build/worker.o build/miner.o build/cpu.o build/main.o `
+    build/sha256.o build/sha256_avx2.o build/sha256_shani.o `
+    -o dist/btcminer.exe -lws2_32 -lsecur32 -lcrypt32
 ```
 
 The build is warning-clean with `-Wall -Wextra`.
@@ -177,16 +188,66 @@ Copy-Item config.example.json config.json
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `url` | Pool URL (`stratum+tcp://host:port`) | — |
+| `url` | Pool URL using `stratum+tcp://`, `stratum+ssl://`, or `stratum+tls://` | — |
 | `user` | Worker name, usually `<BTC address>.<worker>` | — |
 | `password` | Worker password (pools usually ignore it) | `"x"` |
-| `processes` | Number of mining threads (name kept for compatibility) | logical CPUs |
+| `processes` | Number of mining threads (name kept for compatibility) | logical CPUs, or selected CPUs when affinity is set |
 | `stats_interval` | Seconds between hashrate reports | `30` |
 | `idle_timeout` | Reconnect if the pool is silent this long | `300` |
 | `log_level` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 | `duration` | Stop after N seconds (handy for testing) | unlimited |
 | `suggest_difficulty` | Ask the pool for this share difficulty | not sent |
 | `seed` | RNG seed (reproducible nonce start) | random |
+| `pools` | Ordered pool list; when present it supplies the pools, with top-level credentials filling omissions | top-level `url` |
+| `version_rolling` | Enable BIP310 negotiation | `true` |
+| `tls_verify` | Verify TLS certificate chain and hostname; set to `false` only for testing | `true` |
+| `api.enabled` | Enable the local status API | `true` |
+| `api.bind`, `api.port` | API bind address and port | `127.0.0.1`, `4068` |
+| `cpu.affinity` | CPU list (for example `"0-3,6"`) or hexadecimal mask | all CPUs |
+| `cpu.priority` | `idle`, `below`, `normal`, `above`, `high`, or `realtime` | `normal` |
+| `cpu.limit` | Approximate worker duty cycle, 1–100 percent | `100` |
+
+If `pools` is omitted, the legacy top-level `url`, `user`, and `password`
+continue to configure one pool. If it is present, its first entry is the
+primary pool and later entries are tried after repeated failures.
+
+The local API is unauthenticated. Keep its default loopback binding; exposing
+it on another interface can make miner status visible to other machines.
+
+Example multi-pool and operations configuration:
+
+```json
+{
+  "url": "stratum+tcp://solo.ckpool.org:3333",
+  "user": "YOUR_BTC_ADDRESS.worker1",
+  "password": "x",
+  "processes": 4,
+  "pools": [
+    { "url": "stratum+tcp://solo.ckpool.org:3333" },
+    { "url": "stratum+ssl://backup.example.net:443" }
+  ],
+  "version_rolling": true,
+  "tls_verify": true,
+  "api": { "enabled": true, "bind": "127.0.0.1", "port": 4068 },
+  "cpu": { "affinity": "0-3", "priority": "normal", "limit": 100 }
+}
+```
+
+### Operational behavior
+
+- Pools are tried in array order. After two failed connection attempts the miner
+  advances to the next pool; a session lasting over 120 seconds resets the
+  failure count and returns to the primary pool. Reconnect backoff is 2–60 s.
+- TLS certificate-chain and hostname checks are on by default. Setting
+  `tls_verify` to `false` or passing `--tls-insecure` is for testing only.
+- BIP310 version rolling is negotiated by default when supported by the pool.
+  Use `--no-version-rolling` or `"version_rolling": false` to disable it.
+- The unauthenticated API serves JSON from `http://127.0.0.1:4068/status` and
+  `ok` from `/healthz`. Keep it on loopback unless its data may be exposed to
+  other machines; `--no-api` disables it. A bind failure is a warning and does
+  not stop mining.
+- `--cpu-limit` and `cpu.limit` implement an approximate duty cycle, not a hard
+  power or CPU-time quota.
 
 ### Command-line reference
 
@@ -197,16 +258,19 @@ usage: btcminer [-h] [-o URL] [-u USER] [-p PASSWORD] [-t THREADS]
                 [--idle-timeout IDLE_TIMEOUT]
                 [--suggest-difficulty SUGGEST_DIFFICULTY]
                 [--user-agent USER_AGENT] [--seed SEED]
+                [--api-bind HOST:PORT] [--no-api]
+                [--affinity LIST] [--priority LEVEL] [--cpu-limit N]
+                [--tls-insecure] [--no-version-rolling]
                 [--benchmark [SECONDS]] [--self-test]
                 [--log-level {DEBUG,INFO,WARNING,ERROR}] [--version]
 ```
 
 | Option | Description |
 | --- | --- |
-| `-o, --url URL` | Pool URL: `stratum+tcp://host:port`, `stratum://`, `tcp://`, or `host:port` |
+| `-o, --url URL` | Pool URL: `stratum+tcp://`, `stratum+ssl://`, `stratum+tls://`, `ssl://`, `tls://`, `stratum://`, `tcp://`, or `host:port` |
 | `-u, --user USER` | Worker name / BTC address |
 | `-p, --password PASS` | Worker password |
-| `-t, --processes N` | Number of mining threads (default: logical CPUs) |
+| `-t, --processes N` | Number of mining threads (default: logical CPUs, or selected CPUs when affinity is set) |
 | `-c, --config FILE` | JSON config file (default: `./config.json` if present) |
 | `--duration N` | Stop after N seconds |
 | `--stats-interval N` | Seconds between hashrate reports |
@@ -217,6 +281,13 @@ usage: btcminer [-h] [-o URL] [-u USER] [-p PASSWORD] [-t THREADS]
 | `--benchmark [N]` | Hash locally for N seconds (default: 30) |
 | `--self-test` | Verify hashing, target math and a live mine, then exit |
 | `--log-level LEVEL` | `DEBUG`, `INFO`, `WARNING` or `ERROR` |
+| `--api-bind HOST:PORT` | Status API bind address (default `127.0.0.1:4068`) |
+| `--no-api` | Disable the local status API |
+| `--affinity LIST` | Worker CPUs, e.g. `0-3,6` or hexadecimal mask `0xF`; default thread count follows selected CPUs |
+| `--priority LEVEL` | Process and worker priority: `idle`, `below`, `normal`, `above`, `high`, or `realtime` |
+| `--cpu-limit N` | Approximate CPU duty cycle, 1–100 percent |
+| `--tls-insecure` | Skip TLS certificate checks (testing only; not recommended) |
+| `--no-version-rolling` | Disable BIP310 version rolling |
 | `--version` | Print version and exit |
 | `-h, --help` | Print help |
 
@@ -233,6 +304,10 @@ or configuration error.
 # run for 60 s with per-10 s stats and debug logging
 .\dist\btcminer.exe -o pool.example.com:3333 -u user.worker --duration 60 `
                     --stats-interval 10 --log-level DEBUG
+
+# use TLS and cap approximate CPU duty cycle
+.\dist\btcminer.exe -o stratum+ssl://pool.example.com:443 -u user.worker `
+                    --cpu-limit 50 --affinity 0-3
 
 # background run, everything (stdout + stderr) to a log file
 .\dist\btcminer.exe -o stratum+tcp://solo.ckpool.org:3333 `
@@ -278,7 +353,19 @@ and the full mining path are verified against the scalar kernel under Intel SDE
 # 3) end-to-end: a fake pool rebuilds every submitted header independently
 python tests\fake_pool_check.py
 
-# 4) Python reference test-suite (in legacy/)
+# 4) BIP310 negotiation and version-bearing submits
+python tests\fake_pool_check.py --version-rolling
+
+# 5) TLS/SNI and verified-certificate rejection (test-only insecure run)
+python tests\fake_pool_check.py --tls --version-rolling
+
+# 6) failover after two failed primary connections
+python tests\fake_pool_check.py --failover
+
+# 7) HTTP status endpoints; API defaults to loopback port 4068
+python tests\fake_pool_check.py --status-api
+
+# 8) Python reference test-suite (in legacy/)
 cd legacy; python -m unittest discover -v; cd ..
 ```
 
@@ -288,11 +375,13 @@ What each test covers:
 | --- | --- |
 | `--self-test` | Block 125552 hashes to the expected digest (scalar, AVX2 and SHA-NI), difficulty 1/2/0.5 targets are exact, and the worker pool finds and re-verifies real shares |
 | `bench.exe` | Every available kernel agrees with the scalar kernel on 4096 random nonces; prints single-thread MH/s per kernel |
-| `fake_pool_check.py` | The miner's submitted `(job, extranonce2, ntime, nonce)` really hashes below the pool target, using `hashlib`/`struct` instead of the miner's own code |
+| `fake_pool_check.py` | Rebuilds submitted headers independently; optional modes check BIP310, TLS/SNI/certificate rejection, two-failure pool failover, `/status`, `/healthz`, and 404 responses |
 | `legacy/tests` | The Python reference implementation still behaves as documented |
 
 `fake_pool_check.py` exits with `RESULT: PASS` and prints a summary such as
 `valid shares: 3134 invalid: 0`. A single invalid share fails the test.
+The optional TLS test creates a local self-signed certificate and additionally
+requires Python's `cryptography` package; this is a test-only dependency.
 
 ## How it works
 

@@ -273,6 +273,7 @@ void Miner::session(const PoolCredentials& pool) {
 
         for (const Share& share : pool_.drain_shares()) on_share(share);
         stats_tick();
+        refresh_status_snapshot();
 
         if (util::now_seconds() - last_rx_ > config_.idle_timeout) {
             throw StratumDisconnected("no data from pool for " +
@@ -732,7 +733,6 @@ void Miner::stats_tick() {
             : "-",
         have_difficulty_ ? util::format_difficulty(difficulty_).c_str() : "-",
         have_job_ ? job_.id.substr(0, 16).c_str() : "-");
-    refresh_status_snapshot();
 }
 
 void Miner::print_summary() {
@@ -757,6 +757,7 @@ bool Miner::time_exceeded() const {
 void Miner::sleep_interruptible(double seconds) {
     double deadline = util::now_seconds() + seconds;
     while (!stop_.load() && util::now_seconds() < deadline) {
+        refresh_status_snapshot();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
