@@ -62,7 +62,8 @@ lệnh luôn ghi đè file cấu hình.
 ## 2.1. Bản chạy sẵn: `dist\btcminer.exe`
 
 Không cần cài gì cả — dùng file đã build sẵn **`dist\btcminer.exe`** (~2.9 MB,
-một file, biên dịch tĩnh, không cần runtime):
+một file, biên dịch tĩnh, không cần runtime). Bản phát hành chính thức kèm file
+tải về nằm ở [GitHub Releases](https://github.com/Linh2244/btcminer/releases/latest):
 
 ```powershell
 .\dist\btcminer.exe --version

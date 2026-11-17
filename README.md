@@ -9,6 +9,7 @@
 ![Binary](https://img.shields.io/badge/binary%20size-2.85%20MB-lightgrey)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-success)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![Release](https://img.shields.io/github/v/release/Linh2244/btcminer)
 
 `btcminer` connects to any Stratum v1 pool, builds the 80-byte block header from
 the pool's job, scans the nonce space with an 8-lane AVX2 SHA-256d kernel, and
@@ -91,6 +92,12 @@ third-party libraries — only Winsock2.
 | `-lws2_32` | Ships with MinGW-w64 |
 
 ## Quick start
+
+Grab the prebuilt `btcminer.exe` from the
+[latest release](https://github.com/Linh2244/btcminer/releases/latest), or build
+it yourself (see below). The commands use the source-checkout path
+`.\dist\btcminer.exe`; a downloaded release is a single file, so run it from
+wherever you saved it. Then:
 
 ```powershell
 # 1) verify the hashing core, target math and a short mining run (offline)
