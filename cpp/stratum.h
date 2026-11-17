@@ -3,11 +3,16 @@
 
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "json.h"
+
+namespace tls {
+class Session;
+}
 
 class StratumError : public std::runtime_error {
 public:
@@ -24,15 +29,18 @@ struct PoolUrl {
     std::string scheme;
     std::string host;
     uint16_t port = 3333;
+    bool tls = false;
 };
 
 // Accepts stratum+tcp://host:port, stratum://host:port, tcp://host:port and
-// plain host:port.  TLS schemes are rejected with an explicit message.
+// plain host:port, plus the TLS variants stratum+ssl://, stratum+tls://,
+// ssl:// and tls://.  TLS endpoints set PoolUrl::tls.
 bool parse_url(const std::string& url, PoolUrl& out, std::string& error);
 
 class StratumClient {
 public:
-    StratumClient(std::string host, uint16_t port);
+    StratumClient(std::string host, uint16_t port, bool use_tls = false,
+                  bool tls_verify = true);
     ~StratumClient();
 
     StratumClient(const StratumClient&) = delete;
@@ -62,6 +70,9 @@ private:
     std::string host_;
     uint16_t port_;
     uintptr_t socket_;
+    bool use_tls_ = false;
+    bool tls_verify_ = true;
+    std::unique_ptr<tls::Session> tls_;
     std::string buffer_;
     std::deque<Json> backlog_;
     int next_id_ = 0;

@@ -52,14 +52,15 @@ function Build-Object {
 Build-Object -Source "cpp/sha256.cpp"      -Object "build/sha256.o"
 Build-Object -Source "cpp/sha256_avx2.cpp" -Object "build/sha256_avx2.o" -Extra @("-mavx2")
 Build-Object -Source "cpp/sha256_shani.cpp" -Object "build/sha256_shani.o" -Extra @("-msha", "-mssse3", "-msse4.1")
-foreach ($name in @("util", "json", "job", "stratum", "worker", "miner", "cpu", "main")) {
+foreach ($name in @("util", "json", "job", "stratum", "tls", "http", "worker", "miner", "cpu", "main")) {
     Build-Object -Source "cpp/$name.cpp" -Object "build/$name.o"
 }
 
 $objects = @(
     "build/util.o", "build/json.o", "build/job.o", "build/stratum.o",
-    "build/worker.o", "build/miner.o", "build/cpu.o", "build/main.o",
-    "build/sha256.o", "build/sha256_avx2.o", "build/sha256_shani.o"
+    "build/tls.o", "build/http.o", "build/worker.o", "build/miner.o",
+    "build/cpu.o", "build/main.o", "build/sha256.o",
+    "build/sha256_avx2.o", "build/sha256_shani.o"
 )
 
 if ($Tools) {
@@ -79,7 +80,7 @@ if ($Tools) {
 
 New-Item -ItemType Directory -Force dist | Out-Null
 & g++ -O3 -std=c++17 -static -static-libgcc -static-libstdc++ `
-    $objects -o "dist/btcminer.exe" -lws2_32
+    $objects -o "dist/btcminer.exe" -lws2_32 -lsecur32 -lcrypt32
 if ($LASTEXITCODE -ne 0) {
     throw "link failed: dist/btcminer.exe"
 }

@@ -29,7 +29,7 @@ tính block header, tìm nonce thoả mãn target của pool và gửi share v�
 ## 1. Yêu cầu
 
 * Windows 10/11 64-bit (chỉ cần `KERNEL32`, `WS2_32` và UCRT có sẵn của hệ thống).
-* Kết nối Internet tới pool (TCP, không hỗ trợ TLS trong bản này).
+* Kết nối Internet tới pool qua TCP/TLS; hỗ trợ `stratum+ssl://` / `stratum+tls://`.
 * Tài khoản/địa chỉ nhận của pool (ví dụ pool solo dùng chính địa chỉ BTC làm
   username).
 * **Chỉ khi tự build:** MinGW-w64 `g++` (đã kiểm thử với WinLibs g++ 16.1.0,
@@ -327,8 +327,9 @@ có AVX2 + BMI2), bị giới hạn điện năng ~15 W.
   `<user>.<worker>`).
 * Có thể thử `--suggest-difficulty 0.001` để xin difficulty thấp; pool có thể
   bỏ qua.
-* Bản này **không hỗ trợ TLS** (`stratum+ssl://`) và không hỗ trợ version
-  rolling (BIP310) — job vẫn dùng `version` mà pool gửi.
+* Bản này hỗ trợ TLS cho `stratum+ssl://` / `stratum+tls://` và hỗ trợ version
+  rolling (BIP310) khi pool gửi `version-rolling`; nếu cài `--tls-insecure`
+  thì bỏ qua xác thực chứng chỉ trong môi trường test.
 
 ## 9. Bảo mật
 

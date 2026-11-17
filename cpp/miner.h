@@ -6,10 +6,12 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "http.h"
 #include "job.h"
 #include "stratum.h"
 #include "worker.h"
@@ -87,9 +89,12 @@ private:
     void print_summary();
     bool time_exceeded() const;
     void sleep_interruptible(double seconds);
+    void refresh_status_snapshot();
+    StatusSnapshot status_snapshot() const;
 
     MinerConfig config_;
     WorkerPool pool_;
+    std::unique_ptr<StatusServer> status_server_;
 
     std::unique_ptr<StratumClient> client_;
     size_t pool_index_ = 0;
@@ -122,6 +127,8 @@ private:
     double last_rx_ = 0.0;
     double last_stats_ = 0.0;
     double started_at_ = 0.0;
+    mutable std::mutex status_mutex_;
+    StatusSnapshot status_snapshot_;
 
     uint64_t shares_found_ = 0;
     uint64_t accepted_ = 0;

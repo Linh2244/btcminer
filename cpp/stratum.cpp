@@ -16,6 +16,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include "tls.h"
 #include "util.h"
 
 namespace {
@@ -70,12 +71,12 @@ bool parse_url(const std::string& url, PoolUrl& out, std::string& error) {
     std::string scheme = text.substr(0, scheme_end);
     for (char& c : scheme) c = char(std::tolower((unsigned char)c));
 
+    bool use_tls = false;
     if (scheme == "stratum+ssl" || scheme == "stratum+tls" || scheme == "ssl" ||
         scheme == "tls") {
-        error = "TLS pools are not supported, use stratum+tcp";
-        return false;
-    }
-    if (scheme != "stratum" && scheme != "stratum+tcp" && scheme != "tcp") {
+        use_tls = true;
+    } else if (scheme != "stratum" && scheme != "stratum+tcp" &&
+               scheme != "tcp") {
         error = "unsupported URL scheme '" + scheme + "'";
         return false;
     }
@@ -120,11 +121,17 @@ bool parse_url(const std::string& url, PoolUrl& out, std::string& error) {
     out.scheme = scheme;
     out.host = host;
     out.port = uint16_t(port);
+    out.tls = use_tls;
     return true;
 }
 
-StratumClient::StratumClient(std::string host, uint16_t port)
-    : host_(std::move(host)), port_(port), socket_(kInvalidSocket) {
+StratumClient::StratumClient(std::string host, uint16_t port, bool use_tls,
+                             bool tls_verify)
+    : host_(std::move(host)),
+      port_(port),
+      socket_(kInvalidSocket),
+      use_tls_(use_tls),
+      tls_verify_(tls_verify) {
     ensure_winsock();
 }
 
@@ -182,11 +189,28 @@ void StratumClient::connect(int timeout_ms) {
     socket_ = uintptr_t(connected);
     buffer_.clear();
     backlog_.clear();
-    util::log().debug("TCP connection established to %s:%u", host_.c_str(),
-                      unsigned(port_));
+    if (use_tls_) {
+        tls_ = std::make_unique<tls::Session>(uintptr_t(connected), host_,
+                                              tls_verify_);
+        try {
+            tls_->handshake();
+        } catch (const std::exception& error) {
+            tls_.reset();
+            close();
+            throw StratumDisconnected("TLS handshake with " + host_ +
+                                      " failed: " + error.what());
+        }
+        util::log().debug("TLS connection established to %s:%u%s",
+                          host_.c_str(), unsigned(port_),
+                          tls_verify_ ? "" : " (certificate checks disabled)");
+    } else {
+        util::log().debug("TCP connection established to %s:%u", host_.c_str(),
+                          unsigned(port_));
+    }
 }
 
 void StratumClient::close() {
+    tls_.reset();
     if (socket_ == kInvalidSocket) return;
     SOCKET sock = SOCKET(socket_);
     ::shutdown(sock, SD_BOTH);
@@ -200,28 +224,37 @@ void StratumClient::send_raw(const Json& payload) {
     std::string blob = payload.dump();
     blob.push_back('\n');
 
-    size_t sent = 0;
-    while (sent < blob.size()) {
-        int chunk = ::send(SOCKET(socket_), blob.data() + sent,
-                           int(blob.size() - sent), 0);
-        if (chunk == SOCKET_ERROR) {
-            int code = WSAGetLastError();
-            if (code == WSAEWOULDBLOCK) {
-                fd_set write_set;
-                FD_ZERO(&write_set);
-                FD_SET(SOCKET(socket_), &write_set);
-                timeval tv{5, 0};
-                if (::select(0, nullptr, &write_set, nullptr, &tv) <= 0) {
-                    throw StratumDisconnected("send timed out");
+    if (tls_) {
+        try {
+            tls_->send(blob.data(), blob.size());
+        } catch (const std::exception& error) {
+            throw StratumDisconnected(error.what());
+        }
+    } else {
+        size_t sent = 0;
+        while (sent < blob.size()) {
+            int chunk = ::send(SOCKET(socket_), blob.data() + sent,
+                               int(blob.size() - sent), 0);
+            if (chunk == SOCKET_ERROR) {
+                int code = WSAGetLastError();
+                if (code == WSAEWOULDBLOCK) {
+                    fd_set write_set;
+                    FD_ZERO(&write_set);
+                    FD_SET(SOCKET(socket_), &write_set);
+                    timeval tv{5, 0};
+                    if (::select(0, nullptr, &write_set, nullptr, &tv) <= 0) {
+                        throw StratumDisconnected("send timed out");
+                    }
+                    continue;
                 }
-                continue;
-            }
-            if (is_disconnect_error(code)) {
+                if (is_disconnect_error(code)) {
+                    throw StratumDisconnected("send failed: " +
+                                              socket_error_text());
+                }
                 throw StratumDisconnected("send failed: " + socket_error_text());
             }
-            throw StratumDisconnected("send failed: " + socket_error_text());
+            sent += size_t(chunk);
         }
-        sent += size_t(chunk);
     }
 
     std::string shown = blob;
@@ -291,26 +324,42 @@ std::vector<Json> StratumClient::take_backlog() {
 std::vector<Json> StratumClient::read_batch(double timeout_seconds) {
     if (socket_ == kInvalidSocket) throw StratumDisconnected("not connected");
 
-    fd_set read_set;
-    FD_ZERO(&read_set);
-    FD_SET(SOCKET(socket_), &read_set);
-    timeval tv;
-    double clamped = std::max(0.0, timeout_seconds);
-    tv.tv_sec = long(clamped);
-    tv.tv_usec = long((clamped - double(tv.tv_sec)) * 1e6);
-    int ready = ::select(0, &read_set, nullptr, nullptr, &tv);
-    if (ready == SOCKET_ERROR) {
-        throw StratumDisconnected("select failed: " + socket_error_text());
+    // TLS may already hold decrypted bytes that the socket no longer reports.
+    if (!(tls_ && tls_->has_pending())) {
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        FD_SET(SOCKET(socket_), &read_set);
+        timeval tv;
+        double clamped = std::max(0.0, timeout_seconds);
+        tv.tv_sec = long(clamped);
+        tv.tv_usec = long((clamped - double(tv.tv_sec)) * 1e6);
+        int ready = ::select(0, &read_set, nullptr, nullptr, &tv);
+        if (ready == SOCKET_ERROR) {
+            throw StratumDisconnected("select failed: " + socket_error_text());
+        }
+        if (ready == 0) return {};
     }
-    if (ready == 0) return {};
 
     char chunk[kReadSize];
-    int received = ::recv(SOCKET(socket_), chunk, int(sizeof(chunk)), 0);
-    if (received == 0) throw StratumDisconnected("pool closed the connection");
-    if (received == SOCKET_ERROR) {
-        throw StratumDisconnected("receive failed: " + socket_error_text());
+    size_t received = 0;
+    if (tls_) {
+        try {
+            received = tls_->receive(chunk, sizeof(chunk));
+        } catch (const std::exception& error) {
+            throw StratumDisconnected(error.what());
+        }
+        if (received == 0) {
+            throw StratumDisconnected("pool closed the connection");
+        }
+    } else {
+        int got = ::recv(SOCKET(socket_), chunk, int(sizeof(chunk)), 0);
+        if (got == 0) throw StratumDisconnected("pool closed the connection");
+        if (got == SOCKET_ERROR) {
+            throw StratumDisconnected("receive failed: " + socket_error_text());
+        }
+        received = size_t(got);
     }
-    buffer_.append(chunk, size_t(received));
+    buffer_.append(chunk, received);
 
     std::vector<Json> messages;
     size_t start = 0;

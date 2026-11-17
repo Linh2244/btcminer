@@ -28,7 +28,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "1.2.0";
+constexpr const char* kVersion = "1.3.0";
 constexpr const char* kDefaultConfigFile = "config.json";
 
 //: Block 125552 - the classic SHA-256d reference vector.

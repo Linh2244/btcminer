@@ -33,8 +33,28 @@ def bits_to_target(difficulty: float) -> int:
     return int(0xFFFF * 2**208 / difficulty)
 
 
+def stop_pool(pool: "FakePool") -> None:
+    pool.stop_flag.set()
+    try:
+        pool.server.close()
+    except OSError:
+        pass
+
+
+def run_miner(exe, url, seconds, extra=()):
+    command = [
+        exe, "-o", url, "-u", "test.worker", "-p", "x", "-t", "2",
+        "--duration", str(seconds), "--stats-interval", "5",
+        "--log-level", "INFO", "--no-api",
+    ]
+    command.extend(extra)
+    return subprocess.run(
+        command, capture_output=True, text=True, timeout=120,
+    )
+
+
 class FakePool(threading.Thread):
-    def __init__(self, version_rolling: bool = False):
+    def __init__(self, version_rolling: bool = False, tls_context=None):
         super().__init__(daemon=True)
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -54,6 +74,12 @@ class FakePool(threading.Thread):
             True,
         ]
         self.version_rolling = version_rolling
+        self.tls_context = tls_context
+        if tls_context is not None:
+            tls_context.sni_callback = self._record_sni
+        self.sni = None
+        self.handshake_errors = []
+        self.connections = 0
         self.configure_seen = False
         self.version_params = 0
         self.valid = 0
@@ -62,11 +88,35 @@ class FakePool(threading.Thread):
         self.stop_flag = threading.Event()
         self.lock = threading.Lock()
 
+    def _record_sni(self, _ssl_object, server_name, _context):
+        self.sni = server_name
+        return None
+
     def run(self):
-        try:
-            conn, _ = self.server.accept()
-        except OSError:
-            return
+        while not self.stop_flag.is_set():
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            if self.tls_context is not None:
+                conn.settimeout(30)
+                try:
+                    conn = self.tls_context.wrap_socket(conn, server_side=True)
+                except (OSError, ValueError) as exc:
+                    self.handshake_errors.append(repr(exc))
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    continue
+            self.connections += 1
+            try:
+                self._serve(conn)
+            except (OSError, ValueError) as exc:
+                if not self.stop_flag.is_set():
+                    self.errors.append(repr(exc))
+
+    def _serve(self, conn):
         conn.settimeout(60)
         buffer = b""
         try:
@@ -82,17 +132,7 @@ class FakePool(threading.Thread):
                     line, buffer = buffer.split(b"\n", 1)
                     if not line.strip():
                         continue
-                    try:
-                        self._process(conn, json.loads(line))
-                    except (OSError, ValueError) as exc:
-                        # The miner closing the socket at the end of the run is
-                        # normal, not a protocol error.
-                        if self.stop_flag.is_set() or isinstance(
-                            exc, (ConnectionResetError, ConnectionAbortedError)
-                        ):
-                            return
-                        self.errors.append(repr(exc))
-                        return
+                    self._process(conn, json.loads(line))
         finally:
             try:
                 conn.close()
@@ -211,6 +251,123 @@ class FakePool(threading.Thread):
             return False, "exception: %r" % (exc,)
 
 
+def make_test_certificate():
+    """Creates a self-signed localhost certificate for the TLS test."""
+    import datetime
+    import ipaddress
+    import tempfile
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=5))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([
+                x509.DNSName("localhost"),
+                x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+            ]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+
+    folder = tempfile.mkdtemp(prefix="btcminer-tls-")
+    certfile = os.path.join(folder, "cert.pem")
+    keyfile = os.path.join(folder, "key.pem")
+    with open(certfile, "wb") as handle:
+        handle.write(certificate.public_bytes(serialization.Encoding.PEM))
+    with open(keyfile, "wb") as handle:
+        handle.write(key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.TraditionalOpenSSL,
+            serialization.NoEncryption(),
+        ))
+    return certfile, keyfile
+
+
+def run_tls_case(exe, version_rolling):
+    import ssl
+
+    certfile, keyfile = make_test_certificate()
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile, keyfile)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    failures = 0
+
+    print("== TLS with certificate checks disabled ==")
+    pool = FakePool(version_rolling=version_rolling, tls_context=context)
+    pool.start()
+    url = "stratum+ssl://localhost:%d" % pool.port
+    print("fake TLS pool on", url)
+    proc = run_miner(exe, url, 12, ["--tls-insecure"])
+    stop_pool(pool)
+
+    output = proc.stdout + proc.stderr
+    accepted = output.count("share accepted")
+    print("--- miner output ---")
+    print(output.strip())
+    print("--- fake pool ---")
+    print("valid:", pool.valid, "invalid:", pool.invalid, "sni:", pool.sni)
+    for error in pool.errors[:5]:
+        print("  ", error)
+
+    version_ok = True
+    if version_rolling:
+        version_ok = pool.configure_seen and pool.version_params >= 1
+        print("version rolling negotiated:", pool.configure_seen,
+              "| submits with version:", pool.version_params)
+
+    ok = (
+        proc.returncode == 0
+        and pool.valid >= 1
+        and pool.invalid == 0
+        and accepted >= 1
+        and pool.sni == "localhost"
+        and "certificate validation is disabled" in output
+        and version_ok
+    )
+    if not ok:
+        failures += 1
+    print("insecure run:", "PASS" if ok else "FAIL")
+
+    print()
+    print("== TLS with certificate checks enabled (must reject) ==")
+    pool2 = FakePool(version_rolling=version_rolling, tls_context=context)
+    pool2.start()
+    url2 = "stratum+ssl://localhost:%d" % pool2.port
+    proc2 = run_miner(exe, url2, 6)
+    stop_pool(pool2)
+
+    output2 = proc2.stdout + proc2.stderr
+    print(output2.strip())
+    rejected = (
+        proc2.returncode == 0
+        and pool2.valid == 0
+        and output2.count("share accepted") == 0
+        and "certificate" in output2.lower()
+    )
+    if not rejected:
+        failures += 1
+    print("verified run rejects the self-signed certificate:",
+          "PASS" if rejected else "FAIL")
+
+    print("RESULT:", "PASS" if failures == 0 else "FAIL")
+    return 0 if failures == 0 else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -221,6 +378,10 @@ def main():
         "--version-rolling", action="store_true",
         help="advertise BIP310 version rolling in the fake pool",
     )
+    parser.add_argument(
+        "--tls", action="store_true",
+        help="test stratum+ssl with a self-signed certificate",
+    )
     args = parser.parse_args()
 
     exe = os.path.abspath(args.exe)
@@ -228,26 +389,16 @@ def main():
         print("FAIL: executable not found:", exe)
         return 2
 
+    if args.tls:
+        return run_tls_case(exe, args.version_rolling)
+
     pool = FakePool(version_rolling=args.version_rolling)
     pool.start()
     url = "stratum+tcp://127.0.0.1:%d" % pool.port
     print("fake pool on", url)
 
-    proc = subprocess.run(
-        [
-            exe, "-o", url, "-u", "test.worker", "-p", "x", "-t", "2",
-            "--duration", "12", "--stats-interval", "5", "--log-level", "INFO",
-            "--no-api",
-        ],
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
-    pool.stop_flag.set()
-    try:
-        pool.server.close()
-    except OSError:
-        pass
+    proc = run_miner(exe, url, 12)
+    stop_pool(pool)
 
     output = proc.stdout + proc.stderr
     accepted = output.count("share accepted")

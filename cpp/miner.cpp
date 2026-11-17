@@ -16,7 +16,7 @@ namespace {
 
 //: Difficulty assumed if a pool sends a job before mining.set_difficulty.
 constexpr double kDefaultDifficulty = 1.0;
-constexpr const char* kVersion = "1.2.0";
+constexpr const char* kVersion = "1.3.0";
 
 std::string lower_ascii(std::string text) {
     for (char& c : text) c = char(std::tolower((unsigned char)c));
@@ -72,16 +72,33 @@ Miner::Miner(MinerConfig config)
     raw_notify_ = Json::make_array();
 }
 
-Miner::~Miner() { pool_.stop(); }
+Miner::~Miner() {
+    if (status_server_) status_server_->stop();
+    pool_.stop();
+}
 
 void Miner::run() {
     started_at_ = util::now_seconds();
+    refresh_status_snapshot();
     if (config_.pools.empty()) throw StratumError("no pool configured");
     util::log().info(
         "btcminer %s | %zu pool(s) | worker %s | %d thread(s) | kernel %s",
         kVersion, config_.pools.size(), config_.pools.front().user.c_str(),
         config_.threads, sha256::kernel_name());
     pool_.start();
+    if (config_.api_enabled) {
+        try {
+            status_server_ = std::make_unique<StatusServer>(
+                config_.api_bind, config_.api_port,
+                [this]() { return status_snapshot(); });
+            status_server_->start();
+        } catch (const std::exception& error) {
+            util::log().warn("status API is disabled on %s:%u: %s",
+                             config_.api_bind.c_str(), unsigned(config_.api_port),
+                             error.what());
+            status_server_.reset();
+        }
+    }
     double backoff = 2.0;
     int failures_on_pool = 0;
     try {
@@ -192,7 +209,11 @@ void Miner::session(const PoolCredentials& pool) {
     util::log().info("connecting to %s:%u (%s) | pool %zu/%zu", url.host.c_str(),
                      unsigned(url.port), url.scheme.c_str(), pool_index_ + 1,
                      config_.pools.size());
-    client_ = std::make_unique<StratumClient>(url.host, url.port);
+    if (url.tls && !config_.tls_verify) {
+        util::log().warn("TLS certificate validation is disabled for this pool");
+    }
+    client_ = std::make_unique<StratumClient>(url.host, url.port, url.tls,
+                                              config_.tls_verify);
     client_->connect();
 
     Json subscribe_params = Json::make_array();
@@ -642,6 +663,49 @@ void Miner::on_submit_response(long long id, const Json& message) {
 }
 
 // ---------------------------------------------------------------------------
+// status snapshot
+// ---------------------------------------------------------------------------
+StatusSnapshot Miner::status_snapshot() const {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return status_snapshot_;
+}
+
+void Miner::refresh_status_snapshot() {
+    StatusSnapshot snapshot;
+    snapshot.version = std::string("btcminer ") + kVersion;
+    snapshot.uptime = std::max(0.0, util::now_seconds() - started_at_);
+    if (!config_.pools.empty()) {
+        snapshot.pool_url = current_pool().url;
+        snapshot.pool_user = current_pool().user;
+        snapshot.pool_index = pool_index_ + 1;
+        snapshot.pool_count = config_.pools.size();
+    }
+    snapshot.kernel = sha256::kernel_name();
+    snapshot.threads = config_.threads;
+    snapshot.hashes = pool_.hashes();
+    snapshot.shares_found = shares_found_;
+    snapshot.accepted = accepted_;
+    snapshot.rejected = rejected_;
+    snapshot.stale = stale_;
+    snapshot.best_share = best_difficulty_;
+    snapshot.pool_difficulty = have_difficulty_ ? difficulty_ : 0.0;
+    snapshot.job_id = have_job_ ? job_.id : "";
+    snapshot.version_mask = version_mask_;
+    snapshot.switch_count = pool_switches_;
+
+    if (samples_.size() >= 2) {
+        double now = util::now_seconds();
+        double t0 = samples_.front().first;
+        uint64_t h0 = samples_.front().second;
+        snapshot.hashrate = double(snapshot.hashes - h0) /
+                           std::max(now - t0, 1e-9);
+    }
+
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    status_snapshot_ = snapshot;
+}
+
+// ---------------------------------------------------------------------------
 // stats
 // ---------------------------------------------------------------------------
 void Miner::stats_tick() {
@@ -668,6 +732,7 @@ void Miner::stats_tick() {
             : "-",
         have_difficulty_ ? util::format_difficulty(difficulty_).c_str() : "-",
         have_job_ ? job_.id.substr(0, 16).c_str() : "-");
+    refresh_status_snapshot();
 }
 
 void Miner::print_summary() {

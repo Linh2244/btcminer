@@ -116,7 +116,7 @@ wherever you saved it. Then:
 A healthy session looks like this:
 
 ```
-11:05:38  INFO    btcminer 1.2.0 | pool stratum+tcp://solo.ckpool.org:3333 | worker 1A1z....cpptest | 8 thread(s) | kernel sha-ni
+11:05:38  INFO    btcminer 1.3.0 | pool stratum+tcp://solo.ckpool.org:3333 | worker 1A1z....cpptest | 8 thread(s) | kernel sha-ni
 11:05:43  INFO    authorized | extranonce1=bcaf946e | extranonce2_size=8
 11:05:44  INFO    pool difficulty set to 10000
 11:05:58  INFO    16.93 MH/s | accepted 0 | rejected 0 | best share - | difficulty 10000 | job 6ae40f5a0000d42d
@@ -394,12 +394,14 @@ a backlog so notifications pipelined into the same TCP segment as a response are
 handled in arrival order. An idle timeout (default 300 s) forces a reconnect if
 the pool goes silent.
 
-## Limitations
+## Current feature status
 
-- **No TLS.** `stratum+ssl://` / `stratum+tls://` URLs are rejected with an
-  explicit error; no OpenSSL dependency is pulled in.
-- **No version rolling (BIP310).** The `version` field from the pool is used
-  as-is; `mining.set_version_mask` is ignored (logged at debug level).
+- **TLS support.** `stratum+ssl://` / `stratum+tls://` URLs are accepted and
+  validated with Windows SChannel; `--tls-insecure` disables verification for
+  trusted test environments.
+- **BIP310 version rolling.** When the pool negotiates `version-rolling`, the
+  miner sends the configured mask and includes the rolled version in
+  `mining.submit` while a mask is active.
 - **CPU only.** No GPU/ASIC support; not competitive with dedicated hardware.
 - **Single-buffer SHA-NI.** The SHA-NI path interleaves rounds within one nonce
   but does not run several nonces in parallel, so there is still headroom on
