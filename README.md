@@ -93,7 +93,7 @@ third-party libraries — only Winsock2.
 
 ## Quick start
 
-Grab the prebuilt `btcminer.exe` from the
+Grab the prebuilt Windows binary (`btcminer-<version>-windows-x64.exe`) from the
 [latest release](https://github.com/Linh2244/btcminer/releases/latest), or build
 it yourself (see below). The commands use the source-checkout path
 `.\dist\btcminer.exe`; a downloaded release is a single file, so run it from
