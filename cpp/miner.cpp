@@ -34,8 +34,9 @@ std::string json_error_text(const Json& error) {
 
 Miner::Miner(MinerConfig config)
     : config_(std::move(config)),
-      pool_(config_.threads, config_.has_seed ? config_.seed
-                                              : std::random_device{}()) {
+      pool_(config_.threads,
+            config_.has_seed ? config_.seed : std::random_device{}(),
+            config_.affinity_mask, config_.cpu_limit, config_.priority) {
     if (config_.user_agent.empty()) {
         config_.user_agent = std::string("btcminer-cpp/") + kVersion;
     }
@@ -47,22 +48,42 @@ Miner::~Miner() { pool_.stop(); }
 
 void Miner::run() {
     started_at_ = util::now_seconds();
-    util::log().info("btcminer %s | pool %s | worker %s | %d thread(s) | kernel %s",
-                     kVersion, config_.url.c_str(), config_.user.c_str(),
-                     config_.threads, sha256::kernel_name());
+    if (config_.pools.empty()) throw StratumError("no pool configured");
+    util::log().info(
+        "btcminer %s | %zu pool(s) | worker %s | %d thread(s) | kernel %s",
+        kVersion, config_.pools.size(), config_.pools.front().user.c_str(),
+        config_.threads, sha256::kernel_name());
     pool_.start();
     double backoff = 2.0;
+    int failures_on_pool = 0;
     try {
         while (!stop_.load() && !time_exceeded()) {
+            const PoolCredentials& pool = current_pool();
             double session_started = util::now_seconds();
             try {
-                session();
+                session(pool);
             } catch (const std::exception& error) {
                 util::log().warn("%s", error.what());
             }
             close_session();
             if (stop_.load() || time_exceeded()) break;
-            if (util::now_seconds() - session_started > 120.0) backoff = 2.0;
+
+            double lived = util::now_seconds() - session_started;
+            if (lived > 120.0) {
+                backoff = 2.0;
+                failures_on_pool = 0;
+                if (pool_index_ != 0) {
+                    util::log().info("session was stable, returning to the primary pool");
+                    pool_index_ = 0;
+                }
+            } else if (++failures_on_pool >= 2 && config_.pools.size() > 1) {
+                failures_on_pool = 0;
+                pool_index_ = (pool_index_ + 1) % config_.pools.size();
+                ++pool_switches_;
+                util::log().warn("switching to pool %zu/%zu: %s", pool_index_ + 1,
+                                 config_.pools.size(),
+                                 current_pool().url.c_str());
+            }
             util::log().info("reconnecting in %.0f s", backoff);
             sleep_interruptible(backoff);
             backoff = std::min(backoff * 2.0, 60.0);
@@ -133,15 +154,16 @@ void Miner::benchmark(double seconds) {
 // ---------------------------------------------------------------------------
 // session
 // ---------------------------------------------------------------------------
-void Miner::session() {
+void Miner::session(const PoolCredentials& pool) {
     PoolUrl url;
     std::string error;
-    if (!parse_url(config_.url, url, error)) {
+    if (!parse_url(pool.url, url, error)) {
         throw StratumError("invalid pool URL: " + error);
     }
 
-    util::log().info("connecting to %s:%u (%s)", url.host.c_str(),
-                     unsigned(url.port), url.scheme.c_str());
+    util::log().info("connecting to %s:%u (%s) | pool %zu/%zu", url.host.c_str(),
+                     unsigned(url.port), url.scheme.c_str(), pool_index_ + 1,
+                     config_.pools.size());
     client_ = std::make_unique<StratumClient>(url.host, url.port);
     client_->connect();
 
@@ -161,12 +183,12 @@ void Miner::session() {
     }
 
     Json auth_params = Json::make_array();
-    auth_params.push(Json::make_string(config_.user));
-    auth_params.push(Json::make_string(config_.password));
+    auth_params.push(Json::make_string(pool.user));
+    auth_params.push(Json::make_string(pool.password));
     Json authorized = client_->request("mining.authorize", auth_params, 30.0);
     if (!authorized.is_bool() || !authorized.as_bool()) {
-        throw StratumError("pool refused the worker credentials (" +
-                           config_.user + ")");
+        throw StratumError("pool refused the worker credentials (" + pool.user +
+                           ")");
     }
 
     util::log().info("authorized | extranonce1=%s | extranonce2_size=%d",
@@ -458,7 +480,7 @@ void Miner::on_share(const Share& share) {
     }
 
     Json params = Json::make_array();
-    params.push(Json::make_string(config_.user));
+    params.push(Json::make_string(current_pool().user));
     params.push(Json::make_string(share.work->job_id));
     params.push(Json::make_string(share.work->extranonce2_hex));
     params.push(Json::make_string(share.work->ntime_hex));

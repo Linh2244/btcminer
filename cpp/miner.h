@@ -14,10 +14,15 @@
 #include "stratum.h"
 #include "worker.h"
 
-struct MinerConfig {
+struct PoolCredentials {
     std::string url;
     std::string user;
     std::string password = "x";
+};
+
+struct MinerConfig {
+    //: Pools tried in order; the first one is the primary.
+    std::vector<PoolCredentials> pools;
     std::string user_agent;
     int threads = 4;
     double stats_interval = 30.0;
@@ -28,6 +33,23 @@ struct MinerConfig {
     double suggest_difficulty = 0.0;
     bool has_seed = false;
     uint64_t seed = 0;
+
+    // BIP310 version rolling.
+    bool version_rolling = true;
+    uint32_t version_mask = 0x1fffe000u;
+
+    // TLS certificate validation (disable only for testing).
+    bool tls_verify = true;
+
+    // Local status API.
+    bool api_enabled = true;
+    std::string api_bind = "127.0.0.1";
+    uint16_t api_port = 4068;
+
+    // CPU controls.
+    uint64_t affinity_mask = 0;  // 0 = every CPU
+    std::string priority = "normal";
+    int cpu_limit = 100;
 };
 
 class Miner {
@@ -45,8 +67,11 @@ public:
     double best_difficulty() const { return best_difficulty_; }
 
 private:
-    void session();
+    void session(const PoolCredentials& pool);
     void close_session();
+    const PoolCredentials& current_pool() const {
+        return config_.pools[pool_index_];
+    }
     void handle_message(const Json& message);
     void on_notify(const Json& params);
     void on_set_difficulty(const Json& params);
@@ -65,6 +90,8 @@ private:
     WorkerPool pool_;
 
     std::unique_ptr<StratumClient> client_;
+    size_t pool_index_ = 0;
+    size_t pool_switches_ = 0;
     bool have_job_ = false;
     Job job_;
     Json raw_notify_;

@@ -52,13 +52,13 @@ function Build-Object {
 Build-Object -Source "cpp/sha256.cpp"      -Object "build/sha256.o"
 Build-Object -Source "cpp/sha256_avx2.cpp" -Object "build/sha256_avx2.o" -Extra @("-mavx2")
 Build-Object -Source "cpp/sha256_shani.cpp" -Object "build/sha256_shani.o" -Extra @("-msha", "-mssse3", "-msse4.1")
-foreach ($name in @("util", "json", "job", "stratum", "worker", "miner", "main")) {
+foreach ($name in @("util", "json", "job", "stratum", "worker", "miner", "cpu", "main")) {
     Build-Object -Source "cpp/$name.cpp" -Object "build/$name.o"
 }
 
 $objects = @(
     "build/util.o", "build/json.o", "build/job.o", "build/stratum.o",
-    "build/worker.o", "build/miner.o", "build/main.o",
+    "build/worker.o", "build/miner.o", "build/cpu.o", "build/main.o",
     "build/sha256.o", "build/sha256_avx2.o", "build/sha256_shani.o"
 )
 

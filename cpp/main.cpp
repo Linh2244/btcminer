@@ -21,6 +21,7 @@
 #include "job.h"
 #include "json.h"
 #include "miner.h"
+#include "cpu.h"
 #include "sha256.h"
 #include "util.h"
 #include "worker.h"
@@ -51,6 +52,15 @@ struct Options {
     std::string config_file;
     std::string user_agent;
     std::string log_level;
+
+    std::string api_bind;
+    bool no_api = false;
+    std::string affinity;
+    std::string priority;
+    bool have_cpu_limit = false;
+    int cpu_limit = 100;
+    bool tls_insecure = false;
+    bool no_version_rolling = false;
 
     bool have_processes = false;
     int processes = 0;
@@ -124,6 +134,9 @@ void print_help() {
         "                [--idle-timeout IDLE_TIMEOUT]\n"
         "                [--suggest-difficulty SUGGEST_DIFFICULTY]\n"
         "                [--user-agent USER_AGENT] [--seed SEED]\n"
+        "                [--api-bind HOST:PORT] [--no-api]\n"
+        "                [--affinity LIST] [--priority LEVEL] [--cpu-limit N]\n"
+        "                [--tls-insecure] [--no-version-rolling]\n"
         "                [--benchmark [SECONDS]] [--self-test]\n"
         "                [--log-level {DEBUG,INFO,WARNING,ERROR}] [--version]\n"
         "\n"
@@ -142,6 +155,13 @@ void print_help() {
         "  --suggest-difficulty N  ask the pool for this share difficulty\n"
         "  --user-agent STRING   version string sent to the pool\n"
         "  --seed N              RNG seed (reproducible nonce start)\n"
+        "  --api-bind HOST:PORT  status API address (default 127.0.0.1:4068)\n"
+        "  --no-api              disable the local status API\n"
+        "  --affinity LIST       CPUs for workers, e.g. 0-3,6 or 0xF\n"
+        "  --priority LEVEL      idle, below, normal, above, high or realtime\n"
+        "  --cpu-limit N         approximate CPU usage limit, 1-100 percent\n"
+        "  --tls-insecure        skip TLS certificate checks (testing only)\n"
+        "  --no-version-rolling  do not negotiate BIP310 version rolling\n"
         "  --benchmark [N]       hash locally for N seconds (default 30)\n"
         "  --self-test           verify hashing, target math and a real mining run\n"
         "  --log-level LEVEL     DEBUG, INFO, WARNING or ERROR\n"
@@ -191,6 +211,28 @@ bool parse_args(int argc, char** argv, Options& options, std::string& error) {
             if (!take_value(options.user_agent)) return false;
         } else if (arg == "--log-level") {
             if (!take_value(options.log_level)) return false;
+        } else if (arg == "--api-bind") {
+            if (!take_value(options.api_bind)) return false;
+        } else if (arg == "--no-api") {
+            options.no_api = true;
+        } else if (arg == "--affinity") {
+            if (!take_value(options.affinity)) return false;
+        } else if (arg == "--priority") {
+            if (!take_value(options.priority)) return false;
+        } else if (arg == "--cpu-limit") {
+            std::string text;
+            if (!take_value(text)) return false;
+            long long value = std::strtoll(text.c_str(), nullptr, 10);
+            if (value < 1 || value > 100) {
+                error = "invalid CPU limit (1-100): " + text;
+                return false;
+            }
+            options.have_cpu_limit = true;
+            options.cpu_limit = int(value);
+        } else if (arg == "--tls-insecure") {
+            options.tls_insecure = true;
+        } else if (arg == "--no-version-rolling") {
+            options.no_version_rolling = true;
         } else if (arg == "-t" || arg == "--processes") {
             std::string text;
             if (!take_value(text)) return false;
@@ -277,6 +319,7 @@ bool read_file(const std::string& path, std::string& text) {
 }
 
 struct Settings {
+    std::vector<PoolCredentials> pools;
     std::string url;
     std::string user;
     std::string password = "x";
@@ -291,7 +334,42 @@ struct Settings {
     double suggest_difficulty = 0.0;
     bool has_seed = false;
     uint64_t seed = 0;
+
+    bool version_rolling = true;
+    bool tls_verify = true;
+    bool api_enabled = true;
+    std::string api_bind = "127.0.0.1";
+    int api_port = 4068;
+    std::string affinity;
+    uint64_t affinity_mask = 0;
+    std::string priority = "normal";
+    int cpu_limit = 100;
 };
+
+// Splits "host:port" (bracketed IPv6 allowed) into its parts.
+bool split_host_port(const std::string& text, std::string& host, int& port,
+                     std::string& error) {
+    std::string body = text;
+    size_t colon = body.rfind(':');
+    if (colon == std::string::npos) {
+        error = "expected HOST:PORT";
+        return false;
+    }
+    host = body.substr(0, colon);
+    std::string port_text = body.substr(colon + 1);
+    if (host.size() >= 2 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    if (host.empty()) host = "127.0.0.1";
+    char* stop = nullptr;
+    long value = std::strtol(port_text.c_str(), &stop, 10);
+    if (!stop || *stop != '\0' || value < 1 || value > 65535) {
+        error = "invalid port '" + port_text + "'";
+        return false;
+    }
+    port = int(value);
+    return true;
+}
 
 bool apply_json_config(const Json& config, Settings& settings,
                        std::string& error) {
@@ -321,11 +399,96 @@ bool apply_json_config(const Json& config, Settings& settings,
         return false;
     };
 
+    auto bool_field = [&](const char* key, bool& target) -> bool {
+        const Json* value = config.find(key);
+        if (!value || value->is_null()) return true;
+        if (!value->is_bool()) {
+            error = std::string("config field '") + key + "' must be true or false";
+            return false;
+        }
+        target = value->as_bool();
+        return true;
+    };
+
     string_field("url", settings.url);
     string_field("user", settings.user);
     string_field("password", settings.password);
     string_field("user_agent", settings.user_agent);
     string_field("log_level", settings.log_level);
+    if (!bool_field("version_rolling", settings.version_rolling)) return false;
+    if (!bool_field("tls_verify", settings.tls_verify)) return false;
+
+    const Json* pool_list = config.find("pools");
+    if (pool_list && !pool_list->is_null()) {
+        if (!pool_list->is_array()) {
+            error = "config field 'pools' must be a list";
+            return false;
+        }
+        for (size_t i = 0; i < pool_list->size(); ++i) {
+            const Json& entry = (*pool_list)[i];
+            if (!entry.is_object()) {
+                error = "each pool must be a JSON object";
+                return false;
+            }
+            const Json* pool_url = entry.find("url");
+            if (!pool_url || !pool_url->is_string() ||
+                pool_url->as_string().empty()) {
+                error = "pool url must be a non-empty string";
+                return false;
+            }
+            PoolCredentials pool;
+            pool.url = pool_url->as_string();
+            const Json* pool_user = entry.find("user");
+            if (pool_user && pool_user->is_string()) {
+                pool.user = pool_user->as_string();
+            }
+            const Json* pool_password = entry.find("password");
+            if (pool_password && pool_password->is_string()) {
+                pool.password = pool_password->as_string();
+            }
+            settings.pools.push_back(std::move(pool));
+        }
+    }
+
+    const Json* api = config.find("api");
+    if (api && !api->is_null()) {
+        if (!api->is_object()) {
+            error = "config field 'api' must be an object";
+            return false;
+        }
+        const Json* enabled = api->find("enabled");
+        if (enabled && enabled->is_bool()) settings.api_enabled = enabled->as_bool();
+        const Json* bind = api->find("bind");
+        if (bind && bind->is_string()) settings.api_bind = bind->as_string();
+        const Json* port = api->find("port");
+        if (port && port->is_number()) settings.api_port = int(port->as_int(4068));
+    }
+
+    const Json* cpu_config = config.find("cpu");
+    if (cpu_config && !cpu_config->is_null()) {
+        if (!cpu_config->is_object()) {
+            error = "config field 'cpu' must be an object";
+            return false;
+        }
+        const Json* affinity = cpu_config->find("affinity");
+        if (affinity && affinity->is_string()) {
+            settings.affinity = affinity->as_string();
+        } else if (affinity && affinity->is_number()) {
+            char buffer[32];
+            std::snprintf(buffer, sizeof(buffer), "0x%llx",
+                          (unsigned long long)affinity->as_int(0));
+            settings.affinity = buffer;
+        } else if (affinity && !affinity->is_null()) {
+            error = "config field 'cpu.affinity' must be a string or a mask";
+            return false;
+        }
+        const Json* priority = cpu_config->find("priority");
+        if (priority && priority->is_string()) {
+            settings.priority = priority->as_string();
+        }
+        const Json* limit = cpu_config->find("limit");
+        if (limit && limit->is_number()) settings.cpu_limit = int(limit->as_int(100));
+    }
 
     double processes = 0.0;
     if (!number_field("processes", processes)) return false;
@@ -395,7 +558,71 @@ bool build_settings(const Options& options, Settings& settings,
         settings.has_seed = true;
         settings.seed = options.seed;
     }
-    if (settings.threads < 1) settings.threads = default_threads();
+    if (!options.api_bind.empty()) {
+        std::string bind_error;
+        if (!split_host_port(options.api_bind, settings.api_bind,
+                             settings.api_port, bind_error)) {
+            error = "invalid --api-bind: " + bind_error;
+            return false;
+        }
+    }
+    if (options.no_api) settings.api_enabled = false;
+    if (!options.affinity.empty()) settings.affinity = options.affinity;
+    if (!options.priority.empty()) settings.priority = options.priority;
+    if (options.have_cpu_limit) settings.cpu_limit = options.cpu_limit;
+    if (options.tls_insecure) settings.tls_verify = false;
+    if (options.no_version_rolling) settings.version_rolling = false;
+
+    if (!settings.affinity.empty()) {
+        std::string affinity_error;
+        if (!cpu::parse_affinity(settings.affinity, settings.affinity_mask,
+                                 affinity_error)) {
+            error = "invalid affinity: " + affinity_error;
+            return false;
+        }
+    }
+    if (!cpu::valid_priority(settings.priority)) {
+        error = "invalid priority '" + settings.priority +
+                "' (use idle, below, normal, above, high or realtime)";
+        return false;
+    }
+    if (settings.cpu_limit < 1 || settings.cpu_limit > 100) {
+        error = "CPU limit must be between 1 and 100 percent";
+        return false;
+    }
+    if (settings.api_port < 1 || settings.api_port > 65535) {
+        error = "invalid status API port";
+        return false;
+    }
+
+    // Build the pool list: `pools` wins, otherwise the top-level URL is the
+    // primary pool.  CLI overrides patch the primary entry, and the shared
+    // user/password fill pools that omit them.
+    if (!settings.pools.empty()) {
+        if (!settings.url.empty()) settings.pools[0].url = settings.url;
+        if (!settings.user.empty()) settings.pools[0].user = settings.user;
+        if (!settings.password.empty()) {
+            settings.pools[0].password = settings.password;
+        }
+        for (PoolCredentials& pool : settings.pools) {
+            if (pool.user.empty()) pool.user = settings.user;
+            if (pool.password.empty()) pool.password = settings.password;
+        }
+    } else if (!settings.url.empty()) {
+        PoolCredentials pool;
+        pool.url = settings.url;
+        pool.user = settings.user;
+        pool.password = settings.password;
+        settings.pools.push_back(std::move(pool));
+    }
+
+    if (settings.threads < 1) {
+        if (settings.affinity_mask) {
+            settings.threads = std::max(1, cpu::count_cpus(settings.affinity_mask));
+        } else {
+            settings.threads = default_threads();
+        }
+    }
     return true;
 }
 
@@ -636,9 +863,7 @@ int main(int argc, char** argv) {
     util::log().set_level(util::Logger::parse_level(settings.log_level));
 
     MinerConfig config;
-    config.url = settings.url;
-    config.user = settings.user;
-    config.password = settings.password;
+    config.pools = settings.pools;
     config.user_agent = settings.user_agent;
     config.threads = settings.threads;
     config.stats_interval = settings.stats_interval;
@@ -649,31 +874,53 @@ int main(int argc, char** argv) {
     config.suggest_difficulty = settings.suggest_difficulty;
     config.has_seed = settings.has_seed;
     config.seed = settings.seed;
+    config.version_rolling = settings.version_rolling;
+    config.tls_verify = settings.tls_verify;
+    config.api_enabled = settings.api_enabled;
+    config.api_bind = settings.api_bind;
+    config.api_port = uint16_t(settings.api_port);
+    config.affinity_mask = settings.affinity_mask;
+    config.priority = settings.priority;
+    config.cpu_limit = settings.cpu_limit;
 
     if (options.self_test) return run_self_test(config);
 
     try {
+        if (!options.have_benchmark) {
+            if (config.pools.empty()) {
+                std::fprintf(stderr,
+                             "btcminer: missing pool URL: pass -o/--url or "
+                             "create config.json\n");
+                return 2;
+            }
+            for (size_t i = 0; i < config.pools.size(); ++i) {
+                const PoolCredentials& pool = config.pools[i];
+                if (pool.user.empty()) {
+                    std::fprintf(stderr,
+                                 "btcminer: pool %zu has no worker name: pass "
+                                 "-u/--user\n",
+                                 i + 1);
+                    return 2;
+                }
+                PoolUrl parsed_url;
+                std::string url_error;
+                if (!parse_url(pool.url, parsed_url, url_error)) {
+                    std::fprintf(stderr, "btcminer: pool %zu: %s\n", i + 1,
+                                 url_error.c_str());
+                    return 2;
+                }
+            }
+        }
+
+        std::string priority_error;
+        if (!cpu::apply_process_priority(settings.priority, priority_error)) {
+            std::fprintf(stderr, "btcminer: %s\n", priority_error.c_str());
+        }
+
         Miner miner(config);
         if (options.have_benchmark) {
             miner.benchmark(options.benchmark);
             return 0;
-        }
-        if (config.url.empty()) {
-            std::fprintf(stderr,
-                         "btcminer: missing pool URL: pass -o/--url or create "
-                         "config.json\n");
-            return 2;
-        }
-        if (config.user.empty()) {
-            std::fprintf(stderr, "btcminer: missing worker name: pass -u/--user\n");
-            return 2;
-        }
-        PoolUrl parsed_url;
-        std::string url_error;
-        if (!parse_url(config.url, parsed_url, url_error)) {
-            std::fprintf(stderr, "btcminer: invalid pool URL: %s\n",
-                         url_error.c_str());
-            return 2;
         }
         g_miner = &miner;
         std::signal(SIGINT, on_sigint);

@@ -30,7 +30,8 @@ struct Share {
 
 class WorkerPool {
 public:
-    WorkerPool(int threads, uint64_t seed);
+    WorkerPool(int threads, uint64_t seed, uint64_t affinity_mask = 0,
+               int cpu_limit = 100, std::string priority = "normal");
     ~WorkerPool();
 
     WorkerPool(const WorkerPool&) = delete;
@@ -49,6 +50,9 @@ private:
 
     int count_;
     uint64_t seed_;
+    uint64_t affinity_mask_ = 0;
+    int cpu_limit_ = 100;
+    std::string priority_ = "normal";
     std::vector<std::thread> threads_;
     std::atomic<bool> stop_{false};
     std::atomic<uint32_t> generation_{0};
