@@ -1,13 +1,13 @@
 # Build btcminer.exe (single file, Windows).
 #
-# C++17 + AVX2. Cần MinGW-w64 g++ trên PATH (đã test với WinLibs g++ 16.1.0,
-# UCRT). Không cần CMake, không cần .NET, không cần Python.
+# C++17 + AVX2. Requires MinGW-w64 g++ on PATH (tested with WinLibs g++ 16.1.0,
+# UCRT). No CMake, no .NET, no Python.
 #
 #   .\build.ps1              # build dist\btcminer.exe (static, ~2.9 MB)
-#   .\build.ps1 -Clean       # xoá build/ và dist/ trước khi build
-#   .\build.ps1 -Tools       # build thêm build\bench.exe + build\check.exe
+#   .\build.ps1 -Clean       # remove build/ and dist/ before building
+#   .\build.ps1 -Tools       # also build build\bench.exe + build\check.exe
 #
-# Nếu máy tắt script: powershell -ExecutionPolicy Bypass -File .\build.ps1
+# If script execution is disabled: powershell -ExecutionPolicy Bypass -File .\build.ps1
 
 param(
     [switch]$Clean,
@@ -82,9 +82,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "link failed: dist/btcminer.exe"
 }
 
-# Self-test phải chạy được ngay sau khi build. Ghi ra file và tạm hạ
-# $ErrorActionPreference vì PowerShell coi mọi dòng stderr của chương trình
-# native là lỗi khi đang ở chế độ "Stop".
+# The self-test must pass right after the build. Capture its output to a file
+# and temporarily relax $ErrorActionPreference, because PowerShell treats any
+# stderr line from a native program as an error while in "Stop" mode.
 $log = Join-Path $env:TEMP "btcminer-build-selftest.log"
 $previousPreference = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
